@@ -261,6 +261,9 @@ app.post('/api/run', async (req, res) => {
 
 if (SERVE_STATIC) mountStatic(app)
 
+process.on('unhandledRejection', (e) => console.error('[api] unhandledRejection:', e))
+process.on('uncaughtException',  (e) => console.error('[api] uncaughtException:', e))
+
 app.listen(PORT, HOST, () => {
   console.log(`[api] listening on http://${HOST}:${PORT}${SERVE_STATIC ? ' (serving static dist/)' : ''}`)
 })
