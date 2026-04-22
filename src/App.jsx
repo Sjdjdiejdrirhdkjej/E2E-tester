@@ -2,6 +2,22 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 
 function uid() { return 't' + Math.random().toString(36).slice(2, 8) }
 
+async function readJson(r) {
+  const text = await r.text()
+  if (!text) {
+    throw new Error(
+      r.status === 504 || r.status === 502
+        ? `Backend unreachable (HTTP ${r.status}). The dev server may still be starting — try again in a moment.`
+        : `Empty response from server (HTTP ${r.status}).`
+    )
+  }
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error(`Server returned non-JSON (HTTP ${r.status}): ${text.slice(0, 160)}`)
+  }
+}
+
 function describeAction(a) {
   switch (a?.type) {
     case 'wait':       return `wait ${a.milliseconds || 0}ms`
@@ -65,7 +81,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt }),
       })
-      const data = await r.json()
+      const data = await readJson(r)
       if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
       plan = data.plan
     } catch (err) {
@@ -95,7 +111,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ plan }),
       })
-      const data = await r.json()
+      const data = await readJson(r)
       if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
       const duration = data.durationMs ?? Math.round(performance.now() - start)
       const okText = data.passed ? 'PASSED' : 'FAILED (assertion)'
