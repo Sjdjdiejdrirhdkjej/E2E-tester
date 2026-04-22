@@ -6,7 +6,7 @@ was empty on import, so this is a fresh scaffold.
 ## Stack
 - React 18 + Vite 5 (JSX, no TypeScript)
 - Express 5 backend on port 8000 (proxied via `/api` from Vite)
-- AI planner: Fireworks AI — Kimi K2.5 (`accounts/fireworks/models/kimi-k2p5`)
+- AI planner: Fireworks AI — Kimi K2.6 (`accounts/fireworks/models/kimi-k2p6`)
   - Override with `FIREWORKS_MODEL` env var
 - Browser execution: Firecrawl `/v1/scrape` with `actions`
 

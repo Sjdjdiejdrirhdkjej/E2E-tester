@@ -9,7 +9,7 @@ const PORT = Number(process.env.PORT || (SERVE_STATIC ? 5000 : process.env.PORT_
 const HOST = SERVE_STATIC ? '0.0.0.0' : 'localhost'
 const FIREWORKS_API_KEY = process.env.FIREWORKS_API_KEY
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY
-const FIREWORKS_MODEL = process.env.FIREWORKS_MODEL || 'accounts/fireworks/models/kimi-k2p5'
+const FIREWORKS_MODEL = process.env.FIREWORKS_MODEL || 'accounts/fireworks/models/kimi-k2p6'
 
 if (!FIREWORKS_API_KEY) console.warn('[warn] FIREWORKS_API_KEY not set')
 if (!FIRECRAWL_API_KEY) console.warn('[warn] FIRECRAWL_API_KEY not set')
