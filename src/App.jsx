@@ -171,6 +171,10 @@ export default function App() {
         onSelect={setSelectedId}
         onNew={() => { newTask(); setNavOpen(false) }}
         onClose={() => setNavOpen(false)}
+        onDelete={(id) => {
+          setTests((prev) => prev.filter((t) => t.id !== id))
+          setSelectedId((cur) => (cur === id ? null : cur))
+        }}
       />
 
       <section className="main">
@@ -334,7 +338,7 @@ function shortUrl(u) {
   try { const x = new URL(u); return x.host + (x.pathname === '/' ? '' : x.pathname) } catch { return u }
 }
 
-function Sidebar({ tests, selectedId, onSelect, onNew, onClose }) {
+function Sidebar({ tests, selectedId, onSelect, onNew, onClose, onDelete }) {
   return (
     <aside className="sidebar">
       <div className="sidebar-top">
@@ -366,6 +370,17 @@ function Sidebar({ tests, selectedId, onSelect, onNew, onClose }) {
               <span className={`dot ${t.status === 'planning' ? 'running' : t.status}`} />
               <span className="name">{t.name}</span>
               <span className="meta">{t.duration != null ? `${t.duration}ms` : ''}</span>
+              <button
+                className="history-delete"
+                aria-label="Delete task"
+                title="Delete task"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onDelete?.(t.id)
+                }}
+              >
+                <Icon name="trash" />
+              </button>
             </div>
           ))
         )}
@@ -420,6 +435,7 @@ function Icon({ name }) {
     case 'arrow-up':   return <svg viewBox="0 0 24 24" {...common}><path d="M12 19V5M5 12l7-7 7 7"/></svg>
     case 'globe':      return <svg viewBox="0 0 24 24" {...common}><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14 0 18M12 3c-3 3.5-3 14 0 18"/></svg>
     case 'bolt':       return <svg viewBox="0 0 24 24" {...common}><path d="M13 3 4 14h7l-1 7 9-11h-7l1-7Z"/></svg>
+    case 'trash':      return <svg viewBox="0 0 24 24" {...common}><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
     default:           return null
   }
 }

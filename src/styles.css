@@ -134,6 +134,24 @@ button { font-family: inherit; }
   font-size: 14px;
 }
 .history-item .meta { font-size: 11px; color: var(--sidebar-muted); }
+.history-delete {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px;
+  border: 0; border-radius: 6px;
+  background: transparent;
+  color: var(--sidebar-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s ease, background .15s ease, color .15s ease;
+  flex-shrink: 0;
+}
+.history-delete svg { width: 15px; height: 15px; }
+.history-item:hover .history-delete,
+.history-item.active .history-delete { opacity: 1; }
+.history-delete:hover { background: rgba(255,255,255,0.08); color: #ff8a8a; }
+@media (max-width: 720px) {
+  .history-delete { opacity: 1; }
+}
 
 .dot {
   width: 8px; height: 8px; border-radius: 50%;
