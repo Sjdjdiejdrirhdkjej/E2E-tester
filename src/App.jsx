@@ -1,96 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 
-const SEED_TESTS = [
-  {
-    id: 't1',
-    name: 'Login flow — happy path',
-    tags: ['auth', 'smoke'],
-    prompt: 'Verify a user can log in with valid credentials and reach /dashboard.',
-    steps: [
-      'visit /login',
-      'fill #email "user@example.com"',
-      'fill #password "••••••••"',
-      'click button[type=submit]',
-      'expect url to include /dashboard',
-    ],
-  },
-  {
-    id: 't2',
-    name: 'Checkout — single item',
-    tags: ['checkout'],
-    prompt: 'Add one product to the cart and complete checkout end-to-end.',
-    steps: [
-      'visit /shop',
-      'click .product[data-id="42"] button.add',
-      'click #cart-icon',
-      'click button#checkout',
-      'expect text "Order confirmed"',
-    ],
-  },
-  {
-    id: 't3',
-    name: 'Search returns results',
-    tags: ['search', 'smoke'],
-    prompt: 'Type a query into the search bar and assert at least one result.',
-    steps: [
-      'visit /',
-      'fill input[name=q] "shoes"',
-      'press Enter',
-      'expect .results .item to have count >= 1',
-    ],
-  },
-  {
-    id: 't4',
-    name: 'Profile update persists',
-    tags: ['profile'],
-    prompt: 'Edit the display name on /profile and confirm it survives reload.',
-    steps: [
-      'login as "user@example.com"',
-      'visit /profile',
-      'fill #name "Jane Doe"',
-      'click button#save',
-      'reload',
-      'expect #name to have value "Jane Doe"',
-    ],
-  },
-]
-
-const SUGGESTIONS = [
-  {
-    icon: 'login',
-    title: 'Test a login flow',
-    desc: 'Form submit, redirect & session check',
-    prompt: 'Test the login flow end-to-end and verify the user lands on /dashboard.',
-  },
-  {
-    icon: 'cart',
-    title: 'Validate a checkout',
-    desc: 'Add to cart through payment confirmation',
-    prompt: 'Walk through adding an item to the cart and completing checkout.',
-  },
-  {
-    icon: 'search',
-    title: 'Smoke-test search',
-    desc: 'Query, results, empty state',
-    prompt: 'Run a smoke test on the search page with the query "shoes".',
-  },
-  {
-    icon: 'shield',
-    title: 'Auth + permissions',
-    desc: 'Protected routes & role gating',
-    prompt: 'Verify that protected routes redirect unauthenticated users to /login.',
-  },
-]
-
 function uid() { return 't' + Math.random().toString(36).slice(2, 8) }
 
+function stepsFromPrompt(p) {
+  const lower = p.toLowerCase()
+  const steps = ['visit /']
+  if (lower.includes('login') || lower.includes('sign in')) steps.push('fill #email', 'fill #password', 'click button[type=submit]', 'expect url to include /dashboard')
+  else if (lower.includes('search')) steps.push('fill input[name=q]', 'press Enter', 'expect .results .item to have count >= 1')
+  else if (lower.includes('checkout') || lower.includes('cart')) steps.push('click .product button.add', 'click #cart-icon', 'click button#checkout', 'expect text "Order confirmed"')
+  else if (lower.includes('protected') || lower.includes('auth')) steps.push('visit /admin', 'expect url to include /login')
+  else if (lower.includes('sign up') || lower.includes('register')) steps.push('visit /signup', 'fill #email', 'fill #password', 'click button[type=submit]', 'expect text "Welcome"')
+  else steps.push('expect document.title to exist', 'expect status to be 200')
+  return steps
+}
+
 export default function App() {
-  const [tests, setTests] = useState(() =>
-    SEED_TESTS.map((t) => ({ ...t, status: 'pending', duration: null, log: '', stepStatuses: [] }))
-  )
+  const [tests, setTests] = useState([])
   const [selectedId, setSelectedId] = useState(null)
   const [running, setRunning] = useState(false)
   const [draft, setDraft] = useState('')
+  const [navOpen, setNavOpen] = useState(false)
   const cancelRef = useRef(false)
   const streamRef = useRef(null)
 
@@ -106,19 +35,12 @@ export default function App() {
     if (streamRef.current) streamRef.current.scrollTop = streamRef.current.scrollHeight
   }, [selected?.log, selected?.stepStatuses])
 
+  useEffect(() => {
+    setNavOpen(false)
+  }, [selectedId])
+
   function updateTest(id, patch) {
     setTests((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)))
-  }
-
-  function stepsFromPrompt(p) {
-    const lower = p.toLowerCase()
-    const steps = ['visit /']
-    if (lower.includes('login')) steps.push('fill #email "user@example.com"', 'fill #password "••••••••"', 'click button[type=submit]', 'expect url to include /dashboard')
-    else if (lower.includes('search')) steps.push('fill input[name=q] "shoes"', 'press Enter', 'expect .results .item to have count >= 1')
-    else if (lower.includes('checkout') || lower.includes('cart')) steps.push('click .product button.add', 'click #cart-icon', 'click button#checkout', 'expect text "Order confirmed"')
-    else if (lower.includes('protected') || lower.includes('auth')) steps.push('visit /admin', 'expect url to include /login')
-    else steps.push('expect document.title to exist', 'expect status to be 200')
-    return steps
   }
 
   function createFromPrompt(prompt) {
@@ -128,7 +50,6 @@ export default function App() {
     const test = {
       id: uid(),
       name,
-      tags: ['draft'],
       prompt: p,
       status: 'pending',
       duration: null,
@@ -182,8 +103,7 @@ export default function App() {
   async function submitDraft() {
     const t = createFromPrompt(draft)
     setDraft('')
-    if (!t) return
-    if (running) return
+    if (!t || running) return
     setRunning(true)
     cancelRef.current = false
     await runTest(t)
@@ -199,7 +119,7 @@ export default function App() {
   }
 
   async function runAll() {
-    if (running) return
+    if (running || tests.length === 0) return
     setRunning(true)
     cancelRef.current = false
     const ids = tests.map((t) => t.id)
@@ -218,29 +138,33 @@ export default function App() {
   function newTask() { setSelectedId(null); setDraft('') }
 
   return (
-    <div className="app">
+    <div className={`app ${navOpen ? 'nav-open' : ''}`}>
+      {navOpen && <div className="nav-scrim" onClick={() => setNavOpen(false)} />}
       <Sidebar
         tests={tests}
         selectedId={selectedId}
         onSelect={setSelectedId}
-        onNew={newTask}
+        onNew={() => { newTask(); setNavOpen(false) }}
+        onClose={() => setNavOpen(false)}
       />
 
       <section className="main">
         <header className="topbar">
+          <button className="icon-btn ink menu-btn" onClick={() => setNavOpen(true)} aria-label="Menu">
+            <Icon name="menu" />
+          </button>
           <div className="crumb">
-            {selected ? (<><span>Tests</span> · <b>{selected.name}</b></>) : (<>E2E Tester</>)}
+            {selected ? <b>{selected.name}</b> : <>E2E Tester</>}
           </div>
           <div className="top-actions">
             {running ? (
               <button className="btn danger" onClick={cancel}>Stop</button>
             ) : selected ? (
-              <>
-                <button className="btn ghost" onClick={runAll}>Run all</button>
-                <button className="btn primary" onClick={runSelected}>Run test</button>
-              </>
+              <button className="btn primary" onClick={runSelected}>Run</button>
             ) : (
-              <button className="btn ghost" onClick={runAll}>Run all ({counts.total})</button>
+              <button className="btn ghost" onClick={runAll} disabled={tests.length === 0}>
+                Run all{tests.length ? ` (${counts.total})` : ''}
+              </button>
             )}
           </div>
         </header>
@@ -259,7 +183,6 @@ export default function App() {
                 {selected.duration != null && (
                   <span className="pill"><span className="num">{selected.duration}</span>&nbsp;ms</span>
                 )}
-                {selected.tags.map((t) => <span className="pill" key={t}>#{t}</span>)}
               </div>
 
               <div className="bubble">
@@ -300,7 +223,6 @@ export default function App() {
                 <div className="k">Status</div><div className="v">{selected.status}</div>
                 <div className="k">Steps</div><div className="v">{selected.steps.length}</div>
                 <div className="k">Duration</div><div className="v">{selected.duration != null ? `${selected.duration} ms` : '—'}</div>
-                <div className="k">Tags</div><div className="v">{selected.tags.join(', ')}</div>
               </div>
 
               <div className="aside-h">Suite</div>
@@ -310,11 +232,6 @@ export default function App() {
                 <span className="pill fail"><span className="num">{counts.fail || 0}</span> failed</span>
                 <span className="pill run"><span className="num">{counts.running || 0}</span> running</span>
               </div>
-
-              <div className="aside-h">Tips</div>
-              <div style={{ color: 'var(--muted)', fontSize: 12.5 }}>
-                Describe a scenario in natural language in the prompt to spin up a new test.
-              </div>
             </aside>
 
             <div className="dock">
@@ -323,7 +240,6 @@ export default function App() {
                 onChange={setDraft}
                 onSubmit={submitDraft}
                 placeholder="Describe another test scenario…"
-                small
               />
             </div>
           </div>
@@ -339,20 +255,6 @@ export default function App() {
                 onSubmit={submitDraft}
                 placeholder='e.g. "Sign up with a new email and verify a welcome screen appears"'
               />
-
-              <div className="suggestions">
-                {SUGGESTIONS.map((s) => (
-                  <button
-                    key={s.title}
-                    className="sugg"
-                    onClick={() => { setDraft(s.prompt) }}
-                  >
-                    <div className="ico"><Icon name={s.icon} /></div>
-                    <div className="t">{s.title}</div>
-                    <div className="d">{s.desc}</div>
-                  </button>
-                ))}
-              </div>
             </div>
           </div>
         )}
@@ -361,7 +263,7 @@ export default function App() {
   )
 }
 
-function Sidebar({ tests, selectedId, onSelect, onNew }) {
+function Sidebar({ tests, selectedId, onSelect, onNew, onClose }) {
   return (
     <aside className="sidebar">
       <div className="sidebar-top">
@@ -369,8 +271,8 @@ function Sidebar({ tests, selectedId, onSelect, onNew }) {
           <span className="brand-mark" />
           <span>e2e</span>
         </div>
-        <button className="icon-btn" title="Search">
-          <Icon name="search" />
+        <button className="icon-btn close-btn" onClick={onClose} aria-label="Close menu">
+          <Icon name="x" />
         </button>
       </div>
 
@@ -381,28 +283,27 @@ function Sidebar({ tests, selectedId, onSelect, onNew }) {
 
       <div className="sidebar-section">History</div>
       <div className="history">
-        {tests.map((t) => (
-          <div
-            key={t.id}
-            className={`history-item ${t.id === selectedId ? 'active' : ''}`}
-            onClick={() => onSelect(t.id)}
-          >
-            <span className={`dot ${t.status}`} />
-            <span className="name">{t.name}</span>
-            <span className="meta">{t.duration != null ? `${t.duration}ms` : ''}</span>
-          </div>
-        ))}
-      </div>
-
-      <div className="sidebar-bottom">
-        <span className="avatar">QA</span>
-        <span>QA Engineer</span>
+        {tests.length === 0 ? (
+          <div className="history-empty">No tests yet.</div>
+        ) : (
+          tests.map((t) => (
+            <div
+              key={t.id}
+              className={`history-item ${t.id === selectedId ? 'active' : ''}`}
+              onClick={() => onSelect(t.id)}
+            >
+              <span className={`dot ${t.status}`} />
+              <span className="name">{t.name}</span>
+              <span className="meta">{t.duration != null ? `${t.duration}ms` : ''}</span>
+            </div>
+          ))
+        )}
       </div>
     </aside>
   )
 }
 
-function PromptBox({ value, onChange, onSubmit, placeholder, small }) {
+function PromptBox({ value, onChange, onSubmit, placeholder }) {
   const ref = useRef(null)
   useEffect(() => {
     const el = ref.current
@@ -411,7 +312,7 @@ function PromptBox({ value, onChange, onSubmit, placeholder, small }) {
     el.style.height = Math.min(el.scrollHeight, 220) + 'px'
   }, [value])
   return (
-    <div className="prompt" style={small ? { boxShadow: '0 -4px 24px -10px rgba(20,16,8,0.18), 0 1px 2px rgba(20,16,8,0.04)' } : undefined}>
+    <div className="prompt">
       <textarea
         ref={ref}
         value={value}
@@ -423,14 +324,14 @@ function PromptBox({ value, onChange, onSubmit, placeholder, small }) {
           }
         }}
         placeholder={placeholder}
+        rows={1}
       />
       <div className="prompt-row">
         <div className="chip-row">
           <span className="chip"><Icon name="globe" /> Browser</span>
           <span className="chip"><Icon name="bolt" /> Headless</span>
-          <span className="chip"><Icon name="clock" /> 30s timeout</span>
         </div>
-        <button className="send" onClick={onSubmit} title="Run">
+        <button className="send" onClick={onSubmit} title="Run" aria-label="Run">
           <Icon name="arrow-up" />
         </button>
       </div>
@@ -443,22 +344,16 @@ function Icon({ name }) {
   switch (name) {
     case 'plus':
       return <svg viewBox="0 0 24 24" {...common}><path d="M12 5v14M5 12h14"/></svg>
-    case 'search':
-      return <svg viewBox="0 0 24 24" {...common}><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+    case 'menu':
+      return <svg viewBox="0 0 24 24" {...common}><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    case 'x':
+      return <svg viewBox="0 0 24 24" {...common}><path d="M6 6l12 12M18 6 6 18"/></svg>
     case 'arrow-up':
       return <svg viewBox="0 0 24 24" {...common}><path d="M12 19V5M5 12l7-7 7 7"/></svg>
     case 'globe':
       return <svg viewBox="0 0 24 24" {...common}><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14 0 18M12 3c-3 3.5-3 14 0 18"/></svg>
     case 'bolt':
       return <svg viewBox="0 0 24 24" {...common}><path d="M13 3 4 14h7l-1 7 9-11h-7l1-7Z"/></svg>
-    case 'clock':
-      return <svg viewBox="0 0 24 24" {...common}><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
-    case 'login':
-      return <svg viewBox="0 0 24 24" {...common}><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="M10 17l5-5-5-5"/><path d="M15 12H3"/></svg>
-    case 'cart':
-      return <svg viewBox="0 0 24 24" {...common}><path d="M3 3h2l2.4 12.2a2 2 0 0 0 2 1.6h8.2a2 2 0 0 0 2-1.5L21 8H6"/><circle cx="10" cy="20" r="1"/><circle cx="18" cy="20" r="1"/></svg>
-    case 'shield':
-      return <svg viewBox="0 0 24 24" {...common}><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6l8-3Z"/></svg>
     default:
       return null
   }
