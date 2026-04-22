@@ -6,7 +6,7 @@ app.use(express.json({ limit: '2mb' }))
 
 const SERVE_STATIC = process.env.SERVE_STATIC === '1'
 const PORT = Number(process.env.PORT || (SERVE_STATIC ? 5000 : process.env.PORT_API || 8000))
-const HOST = SERVE_STATIC ? '0.0.0.0' : 'localhost'
+const HOST = SERVE_STATIC ? '0.0.0.0' : '127.0.0.1'
 const FIREWORKS_API_KEY = process.env.FIREWORKS_API_KEY
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY
 const FIREWORKS_MODEL = process.env.FIREWORKS_MODEL || 'accounts/fireworks/models/kimi-k2p6'
