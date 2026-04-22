@@ -29,26 +29,33 @@ You receive a single user scenario in plain English and must produce a JSON test
 Return ONLY a JSON object — no prose, no markdown — with the exact shape:
 {
   "name": string,        // <= 80 chars summary of the scenario
-  "url":  string,        // the starting URL (must be a fully-qualified https URL the browser can visit)
-  "actions": [           // ordered actions, max 12
+  "url":  string,        // starting URL (fully-qualified https URL)
+  "actions": [           // ordered, max 12
     { "type": "wait",       "milliseconds": number }                         |
+    { "type": "wait",       "selector": string }                             |
     { "type": "click",      "selector": string }                             |
-    { "type": "write",      "selector": string, "text": string }             |
+    { "type": "write",      "text": string }                                 |
     { "type": "press",      "key": string }                                  |
     { "type": "scroll",     "direction": "up" | "down" }                     |
     { "type": "scrape" }                                                     |
     { "type": "screenshot" }
   ],
-  "expect": [                  // human-readable assertions to verify against the final page text/html
+  "expect": [                  // assertions checked against final page text/html/url
     { "kind": "contains_text", "value": string } |
     { "kind": "url_includes",  "value": string }
   ]
 }
 
-Rules:
-- Always include at least one "screenshot" near the end so the user gets a visual verdict.
-- Keep selectors realistic; prefer ids and roles. If the user did not specify a site, default to https://example.com or a public page that fits the scenario (e.g. https://duckduckgo.com for search).
-- Never invent credentials. If a step requires a username/password the user did not give, use placeholders like "demo@example.com" / "password123".
+CRITICAL RULES (Firecrawl semantics):
+- "write" has NO selector. To type into a field, ALWAYS emit a "click" with the input's selector first, then a "write" with just the text. Example:
+    { "type": "click", "selector": "#email" },
+    { "type": "write", "text": "demo@example.com" }
+- After typing into a form, use { "type": "press", "key": "Enter" } or click the submit button.
+- Insert a small { "type": "wait", "milliseconds": 800 } after navigation/clicks that load content.
+- Always end with a { "type": "screenshot" } so the user gets a visual verdict.
+- Prefer stable selectors (id, name, aria-label, role, button text via attribute). Avoid brittle nth-child chains.
+- If the user did not specify a site, choose a sensible public site (https://example.com, https://duckduckgo.com for search, https://news.ycombinator.com for HN).
+- Never invent real credentials. Use placeholders like "demo@example.com" / "password123".
 - Output JSON only.`
 
 async function callFireworks(messages, { temperature = 0.2, json = true } = {}) {
@@ -125,20 +132,51 @@ function describeAction(a) {
   }
 }
 
+// Map plan actions → exact Firecrawl /v1/scrape action schema.
+// Returns an array (not a single object) so that we can expand bad shapes
+// such as { write, selector, text } into [{click, selector}, {write, text}].
 function sanitizeAction(a) {
-  // Map our minimal schema to firecrawl actions exactly
-  if (a.type === 'wait')       return { type: 'wait', milliseconds: Math.max(50, Number(a.milliseconds) || 500) }
-  if (a.type === 'click')      return { type: 'click', selector: String(a.selector || '') }
-  if (a.type === 'write')      return { type: 'write', selector: String(a.selector || ''), text: String(a.text || '') }
-  if (a.type === 'press')      return { type: 'press', key: String(a.key || 'Enter') }
-  if (a.type === 'scroll')     return { type: 'scroll', direction: a.direction === 'up' ? 'up' : 'down' }
-  if (a.type === 'screenshot') return { type: 'screenshot' }
-  if (a.type === 'scrape')     return { type: 'scrape' }
-  return null
+  if (!a || typeof a !== 'object') return []
+  switch (a.type) {
+    case 'wait': {
+      if (a.selector) return [{ type: 'wait', selector: String(a.selector) }]
+      return [{ type: 'wait', milliseconds: Math.max(50, Number(a.milliseconds) || 500) }]
+    }
+    case 'click': {
+      const sel = String(a.selector || '').trim()
+      return sel ? [{ type: 'click', selector: sel }] : []
+    }
+    case 'write': {
+      const text = String(a.text ?? '')
+      // If the model gave us { write, selector, text }, expand it.
+      if (a.selector) {
+        const sel = String(a.selector).trim()
+        const out = []
+        if (sel) out.push({ type: 'click', selector: sel })
+        out.push({ type: 'write', text })
+        return out
+      }
+      return [{ type: 'write', text }]
+    }
+    case 'press':
+      return [{ type: 'press', key: String(a.key || 'Enter') }]
+    case 'scroll': {
+      const dir = a.direction === 'up' ? 'up' : 'down'
+      const out = { type: 'scroll', direction: dir }
+      if (a.selector) out.selector = String(a.selector)
+      return [out]
+    }
+    case 'screenshot':
+      return [{ type: 'screenshot', fullPage: Boolean(a.fullPage) }]
+    case 'scrape':
+      return [{ type: 'scrape' }]
+    default:
+      return []
+  }
 }
 
 async function runFirecrawl(plan) {
-  const actions = plan.actions.map(sanitizeAction).filter(Boolean)
+  const actions = plan.actions.flatMap(sanitizeAction)
   const body = {
     url: plan.url,
     formats: ['markdown', 'html', 'screenshot'],
