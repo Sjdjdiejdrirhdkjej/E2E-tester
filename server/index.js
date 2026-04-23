@@ -13,9 +13,9 @@ const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY
 /** Model for JSON test planning + post-run summary ("act" path). */
 const FIREWORKS_ACT_MODEL = process.env.FIREWORKS_MODEL || 'accounts/fireworks/models/kimi-k2p6'
 /** Vision-capable model used for the agentic loop so it can actually look at the screenshot.
- *  Override with FIREWORKS_AGENT_MODEL. Default: Qwen2.5-VL-32B (strong vision + tool use). */
+ *  Override with FIREWORKS_AGENT_MODEL. Default: Llama 4 Maverick (latest Meta multimodal flagship on Fireworks — native vision + tool use). */
 const FIREWORKS_AGENT_MODEL =
-  process.env.FIREWORKS_AGENT_MODEL || 'accounts/fireworks/models/qwen2p5-vl-32b-instruct'
+  process.env.FIREWORKS_AGENT_MODEL || 'accounts/fireworks/models/llama4-maverick-instruct-basic'
 /** GLM 5.1 (Z.ai) for plan mode — Fireworks serverless ID; override with FIREWORKS_PLAN_MODEL. */
 const FIREWORKS_PLAN_MODEL =
   process.env.FIREWORKS_PLAN_MODEL || 'accounts/fireworks/models/glm-5p1'
@@ -908,6 +908,84 @@ async function streamAgentTurn({ messages, onReasoning, onContent, signal }) {
   return { name: null, args: null, reasoning, content }
 }
 
+async function forceFinishVerdict({ goal, observation, signal }) {
+  const obsUrl = observation?.url || '(unknown)'
+  const obsTitle = observation?.title || ''
+  const obsText = String(observation?.text || '').slice(0, 6000)
+  const body = {
+    model: FIREWORKS_AGENT_MODEL,
+    max_tokens: 220,
+    temperature: 0,
+    messages: [
+      { role: 'system', content: AGENT_SYSTEM },
+      {
+        role: 'user',
+        content:
+          `You are at the final decision step and must call finish() now.\n` +
+          `Goal: ${goal}\n` +
+          `Current URL: ${obsUrl}\n` +
+          `Page title: ${obsTitle}\n` +
+          `Observed page text/html excerpt:\n${obsText}\n\n` +
+          `Call finish({passed, reason, evidence}) immediately based only on this evidence.`,
+      },
+    ],
+    tools: AGENT_TOOLS,
+    tool_choice: { type: 'function', function: { name: 'finish' } },
+  }
+  const r = await fetch('https://api.fireworks.ai/inference/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${FIREWORKS_API_KEY}`,
+    },
+    body: JSON.stringify(body),
+    signal,
+  })
+  const text = await r.text()
+  if (!r.ok) throw new Error(`Fireworks ${r.status}: ${text.slice(0, 300)}`)
+  let data
+  try {
+    data = JSON.parse(text)
+  } catch {
+    throw new Error('Fireworks returned non-JSON')
+  }
+  const calls = data?.choices?.[0]?.message?.tool_calls
+  const call = Array.isArray(calls) ? calls.find((c) => c?.function?.name === 'finish') : null
+  if (!call) throw new Error('No finish tool call returned')
+  let args = {}
+  try {
+    args = JSON.parse(call.function?.arguments || '{}')
+  } catch {}
+  return {
+    passed: Boolean(args?.passed),
+    reason: String(args?.reason || ''),
+    evidence: String(args?.evidence || ''),
+  }
+}
+
+function heuristicFinishVerdict(goal, observation) {
+  const g = String(goal || '')
+  const text = String(observation?.text || '').toLowerCase()
+  const url = String(observation?.url || '').toLowerCase()
+  const title = String(observation?.title || '').toLowerCase()
+  const haystack = `${text}\n${url}\n${title}`
+  const q = g.match(/["']([^"']{2,80})["']/)?.[1]
+  const mention = g.match(/mentions?\s+([A-Za-z0-9._-]{2,40})/i)?.[1]
+  const token = (q || mention || '').trim()
+  if (token && haystack.includes(token.toLowerCase())) {
+    return {
+      passed: true,
+      reason: `Reached step limit, but observed evidence satisfies "${token}".`,
+      evidence: token,
+    }
+  }
+  return {
+    passed: false,
+    reason: 'Agent reached step limit without calling finish(), and no conclusive evidence was found.',
+    evidence: '',
+  }
+}
+
 async function fetchAsDataUrl(url, signal) {
   try {
     const r = await fetch(url, { signal })
@@ -962,6 +1040,7 @@ app.post('/api/run-agent', async (req, res) => {
     let replay = []
     let lastShot = null
     let lastScrape = null
+    let lastObservation = { url: currentUrl || '', title: '', text: '' }
     let aborted = false
     const ac = new AbortController()
     req.on('close', () => { aborted = true; try { ac.abort() } catch {} })
@@ -995,13 +1074,16 @@ app.post('/api/run-agent', async (req, res) => {
             title: lastScrape?.metadata?.title || '',
             text: htmlToObservation(lastScrape?.html || lastScrape?.markdown || ''),
           }
+          lastObservation = observation
           send('observation', { step, url: observation.url, title: observation.title })
         } catch (err) {
           observation = { url: currentUrl, title: '', text: '', error: String(err.message || err) }
+          lastObservation = observation
           send('observation', { step, url: currentUrl, title: '', error: observation.error })
         }
       } else {
         observation = { url: '(no page yet)', title: '', text: '' }
+        lastObservation = observation
       }
       if (aborted) break
 
@@ -1089,10 +1171,17 @@ app.post('/api/run-agent', async (req, res) => {
     const durationMs = Date.now() - startMs
     const finalUrl = lastScrape?.metadata?.sourceURL || currentUrl || ''
     const title = lastScrape?.metadata?.title || ''
+    if (!verdict && !aborted) {
+      try {
+        verdict = await forceFinishVerdict({ goal, observation: lastObservation, signal: ac.signal })
+      } catch {
+        verdict = heuristicFinishVerdict(goal, lastObservation)
+      }
+    }
     const passed = verdict ? verdict.passed : false
-    const expectations = verdict
-      ? [{ kind: 'agent_verdict', value: verdict.reason || (passed ? 'passed' : 'failed'), pass: passed }]
-      : [{ kind: 'agent_verdict', value: 'agent ran out of steps without calling finish()', pass: false }]
+    const expectations = [
+      { kind: 'agent_verdict', value: verdict?.reason || (passed ? 'passed' : 'failed'), pass: passed },
+    ]
 
     send('summary_start', { passed, expectations, finalUrl, title, durationMs })
     const summary = await streamSummaryRun(
