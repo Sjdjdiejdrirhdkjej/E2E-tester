@@ -498,6 +498,48 @@ app.post('/api/run-stream', async (req, res) => {
     send('start', { url: plan.url, totalActions: plan.actions.length })
 
     const start = Date.now()
+
+    // ---- Quick preview screenshot for instant visual feedback ----
+    // Fire a fast Firecrawl call (no actions) so the user sees the start
+    // page within a few seconds, while the full action run is dispatched
+    // in parallel and replaces these frames as it completes.
+    const previewPromise = (async () => {
+      try {
+        const pr = await fetch('https://api.firecrawl.dev/v1/scrape', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
+          body: JSON.stringify({
+            url: plan.url,
+            formats: ['screenshot'],
+            onlyMainContent: false,
+            waitFor: 400,
+            timeout: 30000,
+          }),
+        })
+        const pt = await pr.text()
+        const pd = JSON.parse(pt)
+        const shot = pd?.data?.screenshot || pd?.screenshot
+        if (shot) {
+          send('cursor', { actionIndex: -1, x: 0.5, y: 0.5, label: 'page loaded — planning first action' })
+          send('frame', { actionIndex: -1, image: shot, preview: true })
+        }
+      } catch { /* preview is best-effort */ }
+    })()
+
+    // Heartbeat so the cursor label keeps changing while Firecrawl runs the full plan
+    const phrases = ['analysing DOM', 'locating elements', 'preparing actions', 'executing plan', 'awaiting response']
+    let hbIdx = 0
+    const heartbeat = setInterval(() => {
+      try {
+        send('cursor', {
+          actionIndex: -1,
+          x: 0.4 + Math.random() * 0.2,
+          y: 0.3 + Math.random() * 0.4,
+          label: phrases[hbIdx++ % phrases.length],
+        })
+      } catch {}
+    }, 2200)
+
     const body = {
       url: plan.url,
       formats: ['markdown', 'html', 'screenshot'],
@@ -511,6 +553,8 @@ app.post('/api/run-stream', async (req, res) => {
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
       body: JSON.stringify(body),
     })
+    clearInterval(heartbeat)
+    await previewPromise.catch(() => {})
     const text = await r.text()
     let data
     try { data = JSON.parse(text) } catch {
