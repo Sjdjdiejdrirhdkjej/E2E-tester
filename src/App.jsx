@@ -208,7 +208,7 @@ export default function App() {
         cursor: (p) => {
           setTests((prev) => prev.map((t) => t.id === id ? {
             ...t,
-            stage: { ...(t.stage || {}), cursor: { x: p.x, y: p.y }, label: p.label, actionIndex: p.actionIndex }
+            stage: { ...(t.stage || {}), cursor: { x: p.x, y: p.y }, label: p.label, actionIndex: p.actionIndex, busy: Boolean(p.busy) }
           } : t))
         },
         thinking: (p) => {
@@ -842,6 +842,7 @@ function LiveStage({ stage, status }) {
   const y = stage?.cursor?.y ?? 0.5
   const label = stage?.label || (status === 'planning' ? 'planning…' : 'working…')
   const frameSrc = stage?.image || null
+  const busy = Boolean(stage?.busy)
   return (
     <div className="stage">
       <div className="stage-bar">
@@ -862,8 +863,16 @@ function LiveStage({ stage, status }) {
             <div className="stage-blank-text">{label}</div>
           </div>
         )}
+        {busy && frameSrc && (
+          <div className="stage-busy" aria-hidden="true">
+            <div className="stage-busy-pill">
+              <span className="loader small" />
+              <span>{label}</span>
+            </div>
+          </div>
+        )}
         <div
-          className="ai-cursor"
+          className={`ai-cursor ${busy ? 'busy' : ''}`}
           style={{ left: `${x * 100}%`, top: `${y * 100}%` }}
         >
           <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">

@@ -879,6 +879,41 @@ ${trimmedHtml}`
       return scrape?.screenshot || null
     }
 
+    function allScreenshots(scrape) {
+      const list = scrape?.actions?.screenshots
+      if (Array.isArray(list) && list.length) return list
+      return scrape?.screenshot ? [scrape.screenshot] : []
+    }
+
+    // Replay all screenshots returned by one Firecrawl call as a sequential
+    // mini-clip so the user sees a short "video" of what just happened.
+    async function streamShots(scrape, actionIndex) {
+      const shots = allScreenshots(scrape)
+      if (!shots.length) return null
+      for (let k = 0; k < shots.length; k++) {
+        send('frame', { image: shots[k], actionIndex, frameIndex: k, totalFrames: shots.length })
+        if (k < shots.length - 1) await sleep(180)
+      }
+      return shots[shots.length - 1]
+    }
+
+    // Build a Firecrawl action list that captures several screenshots around
+    // the real action so that, when the call returns, we can stream a burst
+    // of frames to the client (closest thing to a live feed via /scrape).
+    function burstActions({ replayPrior, sa, beforeWait = 600, dwell = 200, postShots = 4 }) {
+      const out = [
+        ...replayPrior,
+        { type: 'wait', milliseconds: beforeWait },
+        { type: 'screenshot' },           // before
+        sa,
+      ]
+      for (let k = 0; k < postShots; k++) {
+        out.push({ type: 'wait', milliseconds: dwell })
+        out.push({ type: 'screenshot' })  // after, multiple times
+      }
+      return out
+    }
+
     // ---- 1. Initial frame: just open the URL with one screenshot ----
     send('cursor', { actionIndex: -1, x: 0.5, y: 0.1, label: `opening ${plan.url}` })
     let lastShot = null
@@ -920,36 +955,38 @@ ${trimmedHtml}`
         replay.push(sa)
         // Insert a small wait before clicks/writes/presses for resilience on slow pages.
         const needsWait = sa.type === 'click' || sa.type === 'write' || sa.type === 'press'
-        const stepActions = [
-          ...replay.slice(0, -1),
-          ...(needsWait ? [{ type: 'wait', milliseconds: 600 }] : []),
+        const stepActions = burstActions({
+          replayPrior: replay.slice(0, -1),
           sa,
-          { type: 'wait', milliseconds: 400 },
-          { type: 'screenshot' },
-        ]
+          beforeWait: needsWait ? 600 : 250,
+          dwell: 220,
+          postShots: 4,
+        })
         const isLast = i === plan.actions.length - 1
         const formats = isLast ? ['markdown', 'html', 'screenshot'] : ['screenshot']
         let ok = false
+        // Tell the UI we're now waiting on Firecrawl to actually run this step.
+        send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `${label} · executing…`, busy: true })
         try {
           const scrape = await fcScrape({ url: plan.url, actions: stepActions, formats, onlyMain: false })
           lastScrape = scrape
-          const shot = pickScreenshot(scrape)
-          if (shot) { lastShot = shot; send('frame', { image: shot, actionIndex: i }) }
+          const lastBurst = await streamShots(scrape, i)
+          if (lastBurst) lastShot = lastBurst
           ok = true
         } catch (err) {
-          // First retry: same action with a longer wait, in case the element wasn't ready.
+          // First retry: longer waits in case the element wasn't ready.
           try {
-            const retry = [
-              ...replay.slice(0, -1),
-              { type: 'wait', milliseconds: 1500 },
+            const retry = burstActions({
+              replayPrior: replay.slice(0, -1),
               sa,
-              { type: 'wait', milliseconds: 600 },
-              { type: 'screenshot' },
-            ]
+              beforeWait: 1500,
+              dwell: 350,
+              postShots: 3,
+            })
             const scrape = await fcScrape({ url: plan.url, actions: retry, formats, onlyMain: false })
             lastScrape = scrape
-            const shot = pickScreenshot(scrape)
-            if (shot) { lastShot = shot; send('frame', { image: shot, actionIndex: i }) }
+            const lastBurst = await streamShots(scrape, i)
+            if (lastBurst) lastShot = lastBurst
             ok = true
           } catch (err2) {
             // Self-healing: only relevant for selector-based actions (click/wait-for).
@@ -971,17 +1008,17 @@ ${trimmedHtml}`
                 })
                 if (newSel) {
                   const fixed = { ...sa, selector: newSel }
-                  const heal = [
-                    ...replay.slice(0, -1),
-                    { type: 'wait', milliseconds: 800 },
-                    fixed,
-                    { type: 'wait', milliseconds: 500 },
-                    { type: 'screenshot' },
-                  ]
+                  const heal = burstActions({
+                    replayPrior: replay.slice(0, -1),
+                    sa: fixed,
+                    beforeWait: 800,
+                    dwell: 250,
+                    postShots: 3,
+                  })
                   const scrape3 = await fcScrape({ url: plan.url, actions: heal, formats, onlyMain: false })
                   lastScrape = scrape3
-                  const shot3 = pickScreenshot(scrape3)
-                  if (shot3) { lastShot = shot3; send('frame', { image: shot3, actionIndex: i }) }
+                  const lastBurst3 = await streamShots(scrape3, i)
+                  if (lastBurst3) lastShot = lastBurst3
                   // Replace the failed action in replay with the healed one.
                   replay[replay.length - 1] = fixed
                   healed = true

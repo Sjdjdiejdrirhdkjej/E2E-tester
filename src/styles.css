@@ -643,6 +643,25 @@ button { font-family: inherit; }
   z-index: 3;
   filter: drop-shadow(0 2px 6px rgba(0,0,0,0.45));
 }
+.ai-cursor.busy::before {
+  animation-duration: 0.6s;
+  background: rgba(120, 200, 255, 0.55);
+}
+.stage-busy {
+  position: absolute; inset: auto 0 12px 0;
+  display: flex; justify-content: center;
+  pointer-events: none;
+  z-index: 2;
+}
+.stage-busy-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 12px; border-radius: 999px;
+  background: rgba(17, 19, 23, 0.78);
+  color: #fff; font-size: 12px; font-weight: 500;
+  border: 1px solid rgba(255,255,255,0.12);
+  backdrop-filter: blur(6px);
+}
+.loader.small { width: 14px; height: 14px; border-width: 2px; }
 .ai-cursor::before {
   content: "";
   position: absolute;
