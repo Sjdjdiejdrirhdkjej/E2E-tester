@@ -13,9 +13,9 @@ const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY
 /** Model for JSON test planning + post-run summary ("act" path). */
 const FIREWORKS_ACT_MODEL = process.env.FIREWORKS_MODEL || 'accounts/fireworks/models/kimi-k2p6'
 /** Vision-capable model used for the agentic loop so it can actually look at the screenshot.
- *  Override with FIREWORKS_AGENT_MODEL. Default: Llama 4 Maverick (latest Meta multimodal flagship on Fireworks — native vision + tool use). */
+ *  Override with FIREWORKS_AGENT_MODEL. Default: Kimi K2.6 (latest non-Llama multimodal + tool use). */
 const FIREWORKS_AGENT_MODEL =
-  process.env.FIREWORKS_AGENT_MODEL || 'accounts/fireworks/models/llama4-maverick-instruct-basic'
+  process.env.FIREWORKS_AGENT_MODEL || 'accounts/fireworks/models/kimi-k2p6'
 /** GLM 5.1 (Z.ai) for plan mode — Fireworks serverless ID; override with FIREWORKS_PLAN_MODEL. */
 const FIREWORKS_PLAN_MODEL =
   process.env.FIREWORKS_PLAN_MODEL || 'accounts/fireworks/models/glm-5p1'
