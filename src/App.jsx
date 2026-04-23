@@ -70,6 +70,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState(null)
   const [busy, setBusy] = useState(false)
   const [draft, setDraft] = useState('')
+  const [planMode, setPlanMode] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
   const streamRef = useRef(null)
 
@@ -77,7 +78,7 @@ export default function App() {
 
   useEffect(() => {
     if (streamRef.current) streamRef.current.scrollTop = streamRef.current.scrollHeight
-  }, [selected?.log, selected?.status, selected?.screenshots?.length])
+  }, [selected?.log, selected?.status, selected?.screenshots?.length, selected?.strategistMessage])
 
   useEffect(() => { setNavOpen(false) }, [selectedId])
 
@@ -85,52 +86,10 @@ export default function App() {
     setTests((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)))
   }
 
-  async function planAndRun(prompt) {
-    const id = uid()
-    const draftTest = {
-      id,
-      name: prompt.length > 70 ? prompt.slice(0, 67) + '…' : prompt,
-      prompt,
-      status: 'planning',
-      url: null,
-      actions: [],
-      expect: [],
-      stepDescriptions: [],
-      screenshots: [],
-      expectations: [],
-      finalUrl: null,
-      title: '',
-      duration: null,
-      error: null,
-      log: 'Asking Kimi K2 to plan the scenario…\n',
-    }
-    setTests((prev) => [draftTest, ...prev])
-    setSelectedId(id)
-    setBusy(true)
-
-    let plan
-    try {
-      const r = await fetch('/api/plan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt }),
-      })
-      const data = await readJson(r)
-      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
-      plan = data.plan
-    } catch (err) {
-      update(id, {
-        status: 'fail',
-        error: String(err.message || err),
-        log: draftTest.log + `\nPlanner failed: ${err.message || err}\n`,
-      })
-      setBusy(false)
-      return
-    }
-
+  async function executePlannedRun(id, plan, displayNameFallback) {
     update(id, {
       status: 'running',
-      name: plan.name || draftTest.name,
+      name: plan.name || displayNameFallback,
       url: plan.url,
       actions: plan.actions,
       expect: plan.expect,
@@ -189,16 +148,207 @@ export default function App() {
     }
   }
 
+  async function finalizeActPromptRun(id, goal, actPrompt) {
+    setTests((prev) => prev.map((t) => t.id === id ? {
+      ...t,
+      actPrompt,
+      status: 'planning',
+      assistantSnapshot: null,
+      clarifyingAnswers: '',
+      log: (t.log || '') + '\nStrategist called create_plan. Act planner is building the executable plan…\n',
+    } : t))
+
+    let plan
+    try {
+      const r = await fetch('/api/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: actPrompt }),
+      })
+      const data = await readJson(r)
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
+      plan = data.plan
+    } catch (err) {
+      setTests((prev) => prev.map((t) => t.id === id ? {
+        ...t,
+        status: 'fail',
+        error: String(err.message || err),
+        log: (t.log || '') + `\nAct planner failed: ${err.message || err}\n`,
+      } : t))
+      setBusy(false)
+      return
+    }
+
+    const fallbackName = goal.length > 70 ? goal.slice(0, 67) + '…' : goal
+    await executePlannedRun(id, plan, fallbackName)
+  }
+
+  async function startPlanIntake(goal) {
+    const id = uid()
+    const draftTest = {
+      id,
+      name: goal.length > 70 ? goal.slice(0, 67) + '…' : goal,
+      prompt: goal,
+      actPrompt: null,
+      strategistMessage: null,
+      assistantSnapshot: null,
+      clarifyingAnswers: '',
+      status: 'clarifying',
+      url: null,
+      actions: [],
+      expect: [],
+      stepDescriptions: [],
+      screenshots: [],
+      expectations: [],
+      finalUrl: null,
+      title: '',
+      duration: null,
+      error: null,
+      log: 'Plan mode: GLM 5.1 strategist (max reasoning) — only tool: create_plan → act agent…\n',
+    }
+    setTests((prev) => [draftTest, ...prev])
+    setSelectedId(id)
+    setBusy(true)
+
+    let continuedToRun = false
+    try {
+      const r = await fetch('/api/plan-intake', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ goal }),
+      })
+      const data = await readJson(r)
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
+      if (data.actPrompt) {
+        continuedToRun = true
+        await finalizeActPromptRun(id, goal, data.actPrompt)
+        return
+      }
+      if (data.phase === 'converse') {
+        update(id, {
+          strategistMessage: data.strategistMessage || '',
+          assistantSnapshot: data.assistantSnapshot || null,
+          log: draftTest.log + 'Reply below; on continue the strategist must call create_plan for the act agent.\n',
+        })
+        return
+      }
+      throw new Error(data.error || 'Unexpected plan-intake response')
+    } catch (err) {
+      update(id, {
+        status: 'fail',
+        error: String(err.message || err),
+        log: draftTest.log + `\nPlan mode failed: ${err.message || err}\n`,
+      })
+    } finally {
+      if (!continuedToRun) setBusy(false)
+    }
+  }
+
+  async function submitClarifyContinue() {
+    const sel = selected
+    if (!sel || busy || sel.status !== 'clarifying') return
+    const answers = (sel.clarifyingAnswers || '').trim()
+    if (!answers) return
+    const id = sel.id
+    const goal = sel.prompt
+    setBusy(true)
+    try {
+      const r = await fetch('/api/plan-intake', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          goal,
+          answers,
+          assistantSnapshot: sel.assistantSnapshot || null,
+        }),
+      })
+      const data = await readJson(r)
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
+      if (data.actPrompt) {
+        await finalizeActPromptRun(id, goal, data.actPrompt)
+        return
+      }
+      if (data.phase === 'converse') {
+        update(id, {
+          strategistMessage: data.strategistMessage || '',
+          assistantSnapshot: data.assistantSnapshot || null,
+          clarifyingAnswers: '',
+        })
+        setBusy(false)
+        return
+      }
+      throw new Error(data.error || 'Unexpected plan-intake response')
+    } catch (err) {
+      update(id, {
+        status: 'fail',
+        error: String(err.message || err),
+      })
+      setBusy(false)
+    }
+  }
+
+  async function planAndRun(prompt) {
+    const id = uid()
+    const draftTest = {
+      id,
+      name: prompt.length > 70 ? prompt.slice(0, 67) + '…' : prompt,
+      prompt,
+      actPrompt: null,
+      strategistMessage: null,
+      assistantSnapshot: null,
+      clarifyingAnswers: '',
+      status: 'planning',
+      url: null,
+      actions: [],
+      expect: [],
+      stepDescriptions: [],
+      screenshots: [],
+      expectations: [],
+      finalUrl: null,
+      title: '',
+      duration: null,
+      error: null,
+      log: 'Asking the act planner to build the scenario…\n',
+    }
+    setTests((prev) => [draftTest, ...prev])
+    setSelectedId(id)
+    setBusy(true)
+
+    let plan
+    try {
+      const r = await fetch('/api/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt }),
+      })
+      const data = await readJson(r)
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
+      plan = data.plan
+    } catch (err) {
+      update(id, {
+        status: 'fail',
+        error: String(err.message || err),
+        log: draftTest.log + `\nPlanner failed: ${err.message || err}\n`,
+      })
+      setBusy(false)
+      return
+    }
+
+    await executePlannedRun(id, plan, draftTest.name)
+  }
+
   async function submitDraft() {
     const v = draft.trim()
     if (!v || busy) return
     setDraft('')
-    await planAndRun(v)
+    if (planMode) await startPlanIntake(v)
+    else await planAndRun(v)
   }
 
   async function rerun() {
     if (!selected || busy) return
-    await planAndRun(selected.prompt)
+    const prompt = selected.actPrompt || selected.prompt
+    await planAndRun(prompt)
   }
 
   function newTask() { setSelectedId(null); setDraft('') }
@@ -227,7 +377,7 @@ export default function App() {
             {selected ? <b>{selected.name}</b> : <>E2E Tester</>}
           </div>
           <div className="top-actions">
-            {selected && !busy && selected.status !== 'planning' && selected.status !== 'running' && (
+            {selected && !busy && selected.status !== 'planning' && selected.status !== 'running' && selected.status !== 'clarifying' && (
               <button className="btn primary" onClick={rerun}>Re-run</button>
             )}
             {busy && (
@@ -260,6 +410,42 @@ export default function App() {
                 )}
               </div>
 
+              {selected.status === 'clarifying' && (
+                <div className="bubble clarify">
+                  <div className="who">Plan mode · GLM 5.1</div>
+                  {selected.strategistMessage == null && busy ? (
+                    <div className="clarify-loading">
+                      <span className="loader" aria-hidden="true" />
+                      <span>Strategist is thinking (only tool available: create_plan → act agent)…</span>
+                    </div>
+                  ) : (
+                    <>
+                      {selected.strategistMessage != null && (
+                        <div className="clarify-md">{selected.strategistMessage}</div>
+                      )}
+                      <label className="clarify-label" htmlFor="clarify-answers">Your reply</label>
+                      <textarea
+                        id="clarify-answers"
+                        className="clarify-ta"
+                        rows={5}
+                        value={selected.clarifyingAnswers || ''}
+                        onChange={(e) => update(selected.id, { clarifyingAnswers: e.target.value })}
+                        placeholder="Answer the strategist’s questions, or add any missing detail (URL, steps, what to assert)."
+                        disabled={busy}
+                      />
+                      <button
+                        type="button"
+                        className="btn primary clarify-go"
+                        disabled={busy || !(selected.clarifyingAnswers || '').trim()}
+                        onClick={submitClarifyContinue}
+                      >
+                        Continue — create_plan → run
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
+
               {(selected.status === 'running' || selected.status === 'planning') && (
                 <LiveStage
                   stage={selected.stage}
@@ -267,9 +453,16 @@ export default function App() {
                 />
               )}
 
-              {selected.summary && selected.status !== 'running' && selected.status !== 'planning' && (
+              {selected.actPrompt && selected.status !== 'clarifying' && (
                 <div className="bubble">
-                  <div className="who">Summary · Kimi K2</div>
+                  <div className="who">Act brief (from plan mode)</div>
+                  <div className="body" style={{ marginTop: 8, lineHeight: 1.55 }}>{selected.actPrompt}</div>
+                </div>
+              )}
+
+              {selected.summary && selected.status !== 'running' && selected.status !== 'planning' && selected.status !== 'clarifying' && (
+                <div className="bubble">
+                  <div className="who">Summary · act model</div>
                   <div className="body" style={{ marginTop: 8, lineHeight: 1.55 }}>{selected.summary}</div>
                 </div>
               )}
@@ -323,7 +516,8 @@ export default function App() {
 
               <div className="aside-h">Stack</div>
               <div className="kv">
-                <div className="k">Planner</div><div className="v">Kimi K2 · Fireworks</div>
+                <div className="k">Plan mode</div><div className="v">GLM 5.1 · create_plan only</div>
+                <div className="k">Act planner</div><div className="v">Kimi K2 · Fireworks</div>
                 <div className="k">Browser</div><div className="v">Firecrawl /scrape</div>
               </div>
             </aside>
@@ -334,7 +528,9 @@ export default function App() {
                 onChange={setDraft}
                 onSubmit={submitDraft}
                 placeholder="Describe another test scenario…"
-                disabled={busy}
+                disabled={busy || selected?.status === 'clarifying'}
+                planMode={planMode}
+                onPlanModeChange={setPlanMode}
               />
             </div>
           </div>
@@ -342,13 +538,15 @@ export default function App() {
           <div className="scroll">
             <div className="hero">
               <h1 className="hello">Hello, <span className="accent">what shall we test today?</span></h1>
-              <p className="subhello">Describe a user scenario in plain English. Kimi K2 plans it, Firecrawl runs it in a real browser.</p>
+              <p className="subhello">Describe a user scenario in plain English. Plan mode uses GLM 5.1 (max reasoning on Fireworks): it can only call create_plan to brief the act agent, otherwise it asks in plain text; Firecrawl runs the test in a real browser.</p>
               <PromptBox
                 value={draft}
                 onChange={setDraft}
                 onSubmit={submitDraft}
                 placeholder='e.g. "Open duckduckgo.com, search for replit, verify a result mentions Replit"'
                 disabled={busy}
+                planMode={planMode}
+                onPlanModeChange={setPlanMode}
               />
             </div>
           </div>
@@ -398,11 +596,11 @@ function LiveStage({ stage, status }) {
 }
 
 function StatusPill({ status }) {
-  const cls = status === 'pass' ? 'pass' : status === 'fail' ? 'fail' : (status === 'running' || status === 'planning') ? 'run' : ''
-  const label = status === 'planning' ? 'planning' : status
+  const cls = status === 'pass' ? 'pass' : status === 'fail' ? 'fail' : (status === 'running' || status === 'planning' || status === 'clarifying') ? 'run' : ''
+  const label = status === 'planning' ? 'planning' : status === 'clarifying' ? 'plan mode' : status
   return (
     <span className={`pill ${cls}`}>
-      <span className={`dot ${status === 'planning' ? 'running' : status}`} /> {label}
+      <span className={`dot ${status === 'planning' || status === 'clarifying' ? 'running' : status}`} /> {label}
     </span>
   )
 }
@@ -440,7 +638,7 @@ function Sidebar({ tests, selectedId, onSelect, onNew, onClose, onDelete }) {
               className={`history-item ${t.id === selectedId ? 'active' : ''}`}
               onClick={() => onSelect(t.id)}
             >
-              <span className={`dot ${t.status === 'planning' ? 'running' : t.status}`} />
+              <span className={`dot ${t.status === 'planning' || t.status === 'clarifying' ? 'running' : t.status}`} />
               <span className="name">{t.name}</span>
               <span className="meta">{t.duration != null ? `${t.duration}ms` : ''}</span>
               <button
@@ -462,7 +660,7 @@ function Sidebar({ tests, selectedId, onSelect, onNew, onClose, onDelete }) {
   )
 }
 
-function PromptBox({ value, onChange, onSubmit, placeholder, disabled }) {
+function PromptBox({ value, onChange, onSubmit, placeholder, disabled, planMode, onPlanModeChange }) {
   const ref = useRef(null)
   useEffect(() => {
     const el = ref.current
@@ -489,7 +687,18 @@ function PromptBox({ value, onChange, onSubmit, placeholder, disabled }) {
       <div className="prompt-row">
         <div className="chip-row">
           <span className="chip"><Icon name="globe" /> Firecrawl</span>
-          <span className="chip"><Icon name="bolt" /> Kimi K2</span>
+          <span className="chip"><Icon name="bolt" /> Act planner</span>
+          {onPlanModeChange && (
+            <label className="chip plan-toggle" title="GLM 5.1 (max reasoning): only tool is create_plan to brief the act agent; otherwise asks in text">
+              <input
+                type="checkbox"
+                checked={Boolean(planMode)}
+                onChange={(e) => onPlanModeChange(e.target.checked)}
+                disabled={disabled}
+              />
+              Plan mode
+            </label>
+          )}
         </div>
         <button className="send" onClick={onSubmit} title="Run" aria-label="Run" disabled={disabled}>
           <Icon name="arrow-up" />

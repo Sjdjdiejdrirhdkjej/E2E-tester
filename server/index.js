@@ -9,7 +9,13 @@ const PORT = Number(process.env.PORT || (SERVE_STATIC ? 5000 : process.env.PORT_
 const HOST = SERVE_STATIC ? '0.0.0.0' : '127.0.0.1'
 const FIREWORKS_API_KEY = process.env.FIREWORKS_API_KEY
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY
-const FIREWORKS_MODEL = process.env.FIREWORKS_MODEL || 'accounts/fireworks/models/kimi-k2p6'
+/** Model for JSON test planning + post-run summary ("act" path). */
+const FIREWORKS_ACT_MODEL = process.env.FIREWORKS_MODEL || 'accounts/fireworks/models/kimi-k2p6'
+/** GLM 5.1 (Z.ai) for plan mode — Fireworks serverless ID; override with FIREWORKS_PLAN_MODEL. */
+const FIREWORKS_PLAN_MODEL =
+  process.env.FIREWORKS_PLAN_MODEL || 'accounts/fireworks/models/glm-5p1'
+/** Reasoning tier for plan-mode calls: low | medium | high (default high). */
+const FIREWORKS_PLAN_REASONING = process.env.FIREWORKS_PLAN_REASONING || 'high'
 
 if (!FIREWORKS_API_KEY) console.warn('[warn] FIREWORKS_API_KEY not set')
 if (!FIRECRAWL_API_KEY) console.warn('[warn] FIRECRAWL_API_KEY not set')
@@ -19,7 +25,9 @@ app.get('/api/health', (_req, res) => {
     ok: true,
     fireworks: Boolean(FIREWORKS_API_KEY),
     firecrawl: Boolean(FIRECRAWL_API_KEY),
-    model: FIREWORKS_MODEL,
+    actModel: FIREWORKS_ACT_MODEL,
+    planModel: FIREWORKS_PLAN_MODEL,
+    planReasoning: FIREWORKS_PLAN_REASONING,
   })
 })
 
@@ -58,10 +66,16 @@ CRITICAL RULES (Firecrawl semantics):
 - Never invent real credentials. Use placeholders like "demo@example.com" / "password123".
 - Output JSON only.`
 
-async function callFireworks(messages, { temperature = 0.2, json = true } = {}) {
+function stripJsonFence(s) {
+  let t = String(s || '').trim()
+  t = t.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '')
+  return t.trim()
+}
+
+async function callFireworks(messages, { temperature = 0.2, json = true, model, max_tokens = 2048 } = {}) {
   const body = {
-    model: FIREWORKS_MODEL,
-    max_tokens: 2048,
+    model: model || FIREWORKS_ACT_MODEL,
+    max_tokens,
     temperature,
     messages,
   }
@@ -85,9 +99,7 @@ async function callFireworks(messages, { temperature = 0.2, json = true } = {}) 
 }
 
 function parsePlan(raw) {
-  let s = raw.trim()
-  // Strip code fences if any slipped through
-  s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '')
+  const s = stripJsonFence(raw)
   const obj = JSON.parse(s)
   if (!obj || typeof obj !== 'object') throw new Error('Plan is not an object')
   if (!obj.url || typeof obj.url !== 'string') throw new Error('Plan missing url')
@@ -100,6 +112,164 @@ function parsePlan(raw) {
   }
   return obj
 }
+
+const PLAN_STRATEGIST_SYSTEM = `You are the plan-mode strategist for an E2E browser testing product (tests run via Firecrawl: clicks, typing, scrolling, URL/text assertions).
+
+You have NO tools except one: create_plan. Calling create_plan sends ONE detailed natural-language brief to the separate "act" agent, which then builds and runs the executable test. You cannot browse, scrape, or run code.
+
+Rules:
+- If anything important is still ambiguous (target URL, login/credentials policy, exact assertions, scope, locale, which UI path), ask clarifying questions in your normal assistant message (plain text). Do NOT call create_plan until the act agent would not need to guess.
+- When the brief is complete and unambiguous, you MUST call create_plan exactly once. Its argument detailed_prompt must be a single self-contained scenario: explicit https start URL, ordered steps, what to assert on the page or URL. Use placeholders (e.g. demo@example.com) for any secrets—never ask users for real passwords.
+- Do not claim you ran a test or saw a page; you only scope and hand off.`
+
+const CREATE_PLAN_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'create_plan',
+      description:
+        'Send the finalized detailed prompt to the act agent so it can build and run the browser test. This is your ONLY tool. Call it once when the brief is ready.',
+      parameters: {
+        type: 'object',
+        properties: {
+          detailed_prompt: {
+            type: 'string',
+            description:
+              'Full brief for the act agent: start URL, user-visible steps in order, assertions; placeholders only for credentials.',
+          },
+        },
+        required: ['detailed_prompt'],
+      },
+    },
+  },
+]
+
+function extractCreatePlanPrompt(message) {
+  const calls = message?.tool_calls
+  if (!Array.isArray(calls)) return null
+  for (const tc of calls) {
+    if (tc?.function?.name !== 'create_plan') continue
+    let args
+    try {
+      args = JSON.parse(tc.function.arguments || '{}')
+    } catch {
+      continue
+    }
+    const p = String(args?.detailed_prompt ?? args?.detailedPrompt ?? '').trim()
+    if (p) return p
+  }
+  return null
+}
+
+function assistantSnapshotFromMessage(msg) {
+  if (!msg || typeof msg !== 'object') return null
+  const snap = { role: 'assistant', content: msg.content ?? '' }
+  if (msg.reasoning_content) snap.reasoning_content = msg.reasoning_content
+  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) snap.tool_calls = msg.tool_calls
+  return snap
+}
+
+function sanitizeAssistantSnapshot(raw) {
+  if (!raw || typeof raw !== 'object' || raw.role !== 'assistant') return null
+  const out = { role: 'assistant', content: String(raw.content ?? '') }
+  if (typeof raw.reasoning_content === 'string' && raw.reasoning_content.length) {
+    out.reasoning_content = raw.reasoning_content
+  }
+  if (Array.isArray(raw.tool_calls) && raw.tool_calls.length) out.tool_calls = raw.tool_calls
+  return out
+}
+
+async function callFireworksPlanStrategist(messages, { tool_choice = 'auto', max_tokens = 8192 } = {}) {
+  const body = {
+    model: FIREWORKS_PLAN_MODEL,
+    max_tokens,
+    temperature: 0.35,
+    messages,
+    tools: CREATE_PLAN_TOOLS,
+    reasoning_effort: FIREWORKS_PLAN_REASONING,
+  }
+  if (tool_choice !== 'auto') body.tool_choice = tool_choice
+  const hasPriorAssistant = messages.some((m) => m.role === 'assistant')
+  if (hasPriorAssistant) body.reasoning_history = 'preserved'
+
+  const r = await fetch('https://api.fireworks.ai/inference/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${FIREWORKS_API_KEY}`,
+    },
+    body: JSON.stringify(body),
+  })
+  const text = await r.text()
+  if (!r.ok) {
+    throw new Error(`Fireworks ${r.status}: ${text.slice(0, 600)}`)
+  }
+  let data
+  try {
+    data = JSON.parse(text)
+  } catch {
+    throw new Error('Fireworks returned non-JSON')
+  }
+  return data.choices?.[0]?.message || null
+}
+
+app.post('/api/plan-intake', async (req, res) => {
+  try {
+    if (!FIREWORKS_API_KEY) return res.status(400).json({ error: 'FIREWORKS_API_KEY missing' })
+    const { goal, answers, assistantSnapshot: assistantSnapRaw } = req.body || {}
+    if (!goal || typeof goal !== 'string') return res.status(400).json({ error: 'goal required' })
+
+    const messages = [{ role: 'system', content: PLAN_STRATEGIST_SYSTEM }, { role: 'user', content: goal.trim() }]
+
+    const answersTrim = typeof answers === 'string' ? answers.trim() : ''
+    const forceTool = Boolean(answersTrim)
+
+    if (forceTool) {
+      const snap = sanitizeAssistantSnapshot(assistantSnapRaw)
+      if (snap) messages.push(snap)
+      messages.push({
+        role: 'user',
+        content:
+          `The user replied with clarifications and wants you to hand off to the act agent.\n\n` +
+          `Their message:\n${answersTrim}\n\n` +
+          `You MUST call create_plan now with a complete detailed_prompt (no further questions).`,
+      })
+    }
+
+    const msg = await callFireworksPlanStrategist(messages, {
+      tool_choice: forceTool ? { type: 'function', function: { name: 'create_plan' } } : 'auto',
+    })
+    if (!msg) return res.status(502).json({ error: 'Empty strategist response' })
+
+    const actPrompt = extractCreatePlanPrompt(msg)
+    if (actPrompt) {
+      return res.json({ phase: 'done', actPrompt })
+    }
+
+    if (forceTool) {
+      return res.status(422).json({
+        error: 'Strategist did not call create_plan; try adding more concrete answers (URL, steps, assertions).',
+      })
+    }
+
+    const strategistMessage = String(msg.content || '').trim()
+    const assistantSnapshot = assistantSnapshotFromMessage(msg)
+    if (!strategistMessage && !assistantSnapshot?.reasoning_content) {
+      return res.status(422).json({
+        error: 'Strategist returned no text and no create_plan call; try rephrasing your goal.',
+      })
+    }
+
+    return res.json({
+      phase: 'converse',
+      strategistMessage: strategistMessage || '(No text reply; use the box below to add detail, then continue.)',
+      assistantSnapshot,
+    })
+  } catch (err) {
+    console.error('plan-intake error:', err)
+    res.status(500).json({ error: String(err.message || err) })
+  }
+})
 
 app.post('/api/plan', async (req, res) => {
   try {

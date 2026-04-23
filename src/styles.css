@@ -268,7 +268,18 @@ button { font-family: inherit; }
   gap: 8px;
   padding: 4px 4px 0;
 }
-.chip-row { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.chip-row { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; align-items: center; }
+.chip.plan-toggle {
+  cursor: pointer;
+  user-select: none;
+  gap: 6px;
+  display: inline-flex;
+  align-items: center;
+}
+.chip.plan-toggle input {
+  margin: 0;
+  accent-color: var(--ink);
+}
 .chip {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 5px 10px;
@@ -334,6 +345,54 @@ button { font-family: inherit; }
   margin-bottom: 12px;
   box-shadow: var(--shadow);
 }
+.bubble.clarify .clarify-lead {
+  margin: 8px 0 0;
+  font-size: 13.5px;
+  color: var(--ink-2);
+}
+.clarify-md {
+  margin-top: 10px;
+  white-space: pre-wrap;
+  line-height: 1.55;
+  color: var(--ink-2);
+  font-size: 14px;
+}
+.clarify-loading {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+  color: var(--ink-2);
+  font-size: 14px;
+}
+.clarify-loading .loader { flex-shrink: 0; }
+.clarify-label {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.clarify-ta {
+  width: 100%;
+  resize: vertical;
+  min-height: 100px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font: inherit;
+  line-height: 1.5;
+  background: var(--paper);
+  color: var(--ink);
+}
+.clarify-ta:focus {
+  outline: none;
+  border-color: var(--line-2);
+  box-shadow: 0 0 0 3px rgba(30, 24, 12, 0.06);
+}
+.clarify-go { margin-top: 12px; }
+
 .bubble .who {
   font-size: 11px;
   text-transform: uppercase;
