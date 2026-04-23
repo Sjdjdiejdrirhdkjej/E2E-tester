@@ -129,13 +129,14 @@ function stripJsonFence(s) {
   return t.trim()
 }
 
-async function callFireworks(messages, { temperature = 0.2, json = true, model, max_tokens = 2048 } = {}) {
+async function callFireworks(messages, { temperature = 0.2, json = true, model, max_tokens = 2048, reasoning_effort = null } = {}) {
   const body = {
     model: model || FIREWORKS_ACT_MODEL,
     max_tokens,
     temperature,
     messages,
   }
+  if (reasoning_effort) body.reasoning_effort = reasoning_effort
   if (json) body.response_format = { type: 'json_object' }
 
   const r = await fetch('https://api.fireworks.ai/inference/v1/chat/completions', {
@@ -362,6 +363,7 @@ app.post('/api/plan-stream', async (req, res) => {
       ],
       response_format: { type: 'json_object' },
       stream: true,
+      reasoning_effort: FIREWORKS_PLAN_REASONING,
     }
     const r = await fetch('https://api.fireworks.ai/inference/v1/chat/completions', {
       method: 'POST',
@@ -424,10 +426,10 @@ app.post('/api/plan', async (req, res) => {
     const { prompt } = req.body || {}
     if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt required' })
 
-    const raw = await callFireworks([
-      { role: 'system', content: PLAN_SYSTEM },
-      { role: 'user', content: prompt },
-    ])
+    const raw = await callFireworks(
+      [{ role: 'system', content: PLAN_SYSTEM }, { role: 'user', content: prompt }],
+      { reasoning_effort: FIREWORKS_PLAN_REASONING }
+    )
     const plan = parsePlan(raw)
     res.json({ plan })
   } catch (err) {
@@ -492,7 +494,7 @@ Build a fresh plan that:
 
     const raw = await callFireworks(
       [{ role: 'system', content: PLAN_SYSTEM }, { role: 'user', content: usr }],
-      { temperature: 0.2, json: true, max_tokens: 2048 }
+      { temperature: 0.2, json: true, max_tokens: 2048, reasoning_effort: FIREWORKS_PLAN_REASONING }
     )
     const plan = parsePlan(raw)
     plan.url = startUrl // hard-pin start URL
@@ -664,7 +666,7 @@ function buildStreamingActions(planActions) {
   return { actions: out, frameMap }
 }
 
-async function streamFireworks(messages, onDelta, { temperature = 0.3, model, max_tokens = 600 } = {}) {
+async function streamFireworks(messages, onDelta, { temperature = 0.3, model, max_tokens = 600, reasoning_effort = null } = {}) {
   const body = {
     model: model || FIREWORKS_ACT_MODEL,
     max_tokens,
@@ -672,6 +674,7 @@ async function streamFireworks(messages, onDelta, { temperature = 0.3, model, ma
     messages,
     stream: true,
   }
+  if (reasoning_effort) body.reasoning_effort = reasoning_effort
   const r = await fetch('https://api.fireworks.ai/inference/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -733,7 +736,7 @@ async function streamSummaryRun({ plan, finalUrl, title, expectations, passed, d
     return await streamFireworks(
       [{ role: 'system', content: sys }, { role: 'user', content: usr }],
       onDelta,
-      { temperature: 0.3 }
+      { temperature: 0.3, reasoning_effort: FIREWORKS_PLAN_REASONING }
     )
   } catch {
     const verdict = passed ? 'passed' : 'failed'
@@ -760,7 +763,7 @@ async function summarizeRun({ plan, finalUrl, title, expectations, passed, durat
       `Assertions: ${JSON.stringify(expectations)}\n`
     const out = await callFireworks(
       [{ role: 'system', content: sys }, { role: 'user', content: usr }],
-      { temperature: 0.3, json: false }
+      { temperature: 0.3, json: false, reasoning_effort: FIREWORKS_PLAN_REASONING }
     )
     return out.trim()
   } catch (err) {
@@ -851,7 +854,11 @@ async function streamAgentTurn({ messages, onReasoning, onContent, signal }) {
     tools: AGENT_TOOLS,
     tool_choice: 'auto',
     stream: true,
+    reasoning_effort: FIREWORKS_PLAN_REASONING,
   }
+  const hasPriorAssistant = messages.some((m) => m.role === 'assistant')
+  if (hasPriorAssistant) body.reasoning_history = 'preserved'
+
   const r = await fetch('https://api.fireworks.ai/inference/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -1142,11 +1149,13 @@ app.post('/api/run-agent', async (req, res) => {
       }
 
       // Persist the assistant turn so the model has memory.
-      messages.push({
+      const assistantMsg = {
         role: 'assistant',
         content: turn.content || '',
         tool_calls: [{ id: `c${step}`, type: 'function', function: { name: turn.name, arguments: JSON.stringify(turn.args || {}) } }],
-      })
+      }
+      if (turn.reasoning) assistantMsg.reasoning_content = turn.reasoning
+      messages.push(assistantMsg)
 
       const label = shortLabel(turn.name, turn.args || {})
       const cursor = estimateCursor(turn.name === 'click' ? { type: 'click', selector: turn.args?.selector } : { type: turn.name }, prev)
