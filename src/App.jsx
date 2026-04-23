@@ -2,6 +2,33 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 
 function uid() { return 't' + Math.random().toString(36).slice(2, 8) }
 
+function stripForPersist(task) {
+  if (!task) return task
+  const { stage, summaryStreaming, ...rest } = task
+  return rest
+}
+
+async function persistTask(task) {
+  if (!task || !task.id) return
+  try {
+    await fetch(`/api/tasks/${encodeURIComponent(task.id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(stripForPersist(task)),
+    })
+  } catch (err) {
+    console.warn('persist task failed', err)
+  }
+}
+
+async function deleteTaskRemote(id) {
+  try {
+    await fetch(`/api/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  } catch (err) {
+    console.warn('delete task failed', err)
+  }
+}
+
 async function readJson(r) {
   const text = await r.text()
   if (!text) {
@@ -77,13 +104,51 @@ export default function App() {
   const selected = useMemo(() => tests.find((t) => t.id === selectedId) || null, [tests, selectedId])
 
   useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const r = await fetch('/api/tasks')
+        if (!r.ok) return
+        const data = await r.json()
+        if (cancelled) return
+        if (Array.isArray(data?.tasks)) {
+          // Reset any non-terminal status from a prior session.
+          const cleaned = data.tasks.map((t) => {
+            if (t.status === 'running' || t.status === 'planning') {
+              return { ...t, status: 'fail', error: t.error || 'Interrupted (server restarted)' }
+            }
+            return t
+          })
+          setTests(cleaned)
+        }
+      } catch (err) {
+        console.warn('load tasks failed', err)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [])
+
+  useEffect(() => {
     if (streamRef.current) streamRef.current.scrollTop = streamRef.current.scrollHeight
   }, [selected?.log, selected?.status, selected?.screenshots?.length, selected?.strategistMessage])
+
+  function persistById(id) {
+    setTests((prev) => {
+      const t = prev.find((x) => x.id === id)
+      if (t) persistTask(t)
+      return prev
+    })
+  }
 
   useEffect(() => { setNavOpen(false) }, [selectedId])
 
   function update(id, patch) {
-    setTests((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)))
+    setTests((prev) => {
+      const next = prev.map((t) => (t.id === id ? { ...t, ...patch } : t))
+      const updated = next.find((t) => t.id === id)
+      if (updated) persistTask(updated)
+      return next
+    })
   }
 
   async function executePlannedRun(id, plan, displayNameFallback) {
@@ -117,17 +182,22 @@ export default function App() {
           } : t))
         },
         summary_start: (p) => {
-          setTests((prev) => prev.map((t) => t.id === id ? {
-            ...t,
-            status: p.passed ? 'pass' : 'fail',
-            duration: p.durationMs,
-            expectations: p.expectations || [],
-            finalUrl: p.finalUrl,
-            title: p.title,
-            summary: '',
-            summaryStreaming: true,
-            stage: t.stage ? { ...t.stage, label: p.passed ? 'done' : 'failed', finished: true } : null,
-          } : t))
+          setTests((prev) => {
+            const next = prev.map((t) => t.id === id ? {
+              ...t,
+              status: p.passed ? 'pass' : 'fail',
+              duration: p.durationMs,
+              expectations: p.expectations || [],
+              finalUrl: p.finalUrl,
+              title: p.title,
+              summary: '',
+              summaryStreaming: true,
+              stage: t.stage ? { ...t.stage, label: p.passed ? 'done' : 'failed', finished: true } : null,
+            } : t)
+            const u = next.find((t) => t.id === id)
+            if (u) persistTask(u)
+            return next
+          })
         },
         summary_delta: (p) => {
           setTests((prev) => prev.map((t) => t.id === id
@@ -135,33 +205,43 @@ export default function App() {
             : t))
         },
         done: (p) => {
-          setTests((prev) => prev.map((t) => t.id === id ? {
-            ...t,
-            status: p.passed ? 'pass' : 'fail',
-            duration: p.durationMs,
-            screenshots: p.screenshots || [],
-            expectations: p.expectations || [],
-            finalUrl: p.finalUrl,
-            title: p.title,
-            summary: p.summary || t.summary,
-            summaryStreaming: false,
-            stage: {
-              image: (p.screenshots && p.screenshots[p.screenshots.length - 1]) || t.stage?.image || null,
-              cursor: t.stage?.cursor || { x: 0.5, y: 0.5 },
-              label: p.passed ? 'done' : 'failed',
-              actionIndex: -1,
-              finished: true,
-            },
-          } : t))
+          setTests((prev) => {
+            const next = prev.map((t) => t.id === id ? {
+              ...t,
+              status: p.passed ? 'pass' : 'fail',
+              duration: p.durationMs,
+              screenshots: p.screenshots || [],
+              expectations: p.expectations || [],
+              finalUrl: p.finalUrl,
+              title: p.title,
+              summary: p.summary || t.summary,
+              summaryStreaming: false,
+              stage: {
+                image: (p.screenshots && p.screenshots[p.screenshots.length - 1]) || t.stage?.image || null,
+                cursor: t.stage?.cursor || { x: 0.5, y: 0.5 },
+                label: p.passed ? 'done' : 'failed',
+                actionIndex: -1,
+                finished: true,
+              },
+            } : t)
+            const u = next.find((t) => t.id === id)
+            if (u) persistTask(u)
+            return next
+          })
         },
         error: (p) => {
-          setTests((prev) => prev.map((t) => t.id === id ? {
-            ...t,
-            status: 'fail',
-            error: p.error,
-            summary: null,
-            stage: t.stage ? { ...t.stage, label: 'error', finished: true } : null,
-          } : t))
+          setTests((prev) => {
+            const next = prev.map((t) => t.id === id ? {
+              ...t,
+              status: 'fail',
+              error: p.error,
+              summary: null,
+              stage: t.stage ? { ...t.stage, label: 'error', finished: true } : null,
+            } : t)
+            const u = next.find((t) => t.id === id)
+            if (u) persistTask(u)
+            return next
+          })
         },
       })
     } catch (err) {
@@ -236,6 +316,7 @@ export default function App() {
     setTests((prev) => [draftTest, ...prev])
     setSelectedId(id)
     setBusy(true)
+    persistTask(draftTest)
 
     let continuedToRun = false
     try {
@@ -340,6 +421,7 @@ export default function App() {
     setTests((prev) => [draftTest, ...prev])
     setSelectedId(id)
     setBusy(true)
+    persistTask(draftTest)
 
     let plan
     try {
@@ -404,6 +486,7 @@ export default function App() {
     setTests((prev) => [draftTest, ...prev])
     setSelectedId(id)
     setBusy(true)
+    persistTask(draftTest)
     let plan
     try {
       const r = await fetch('/api/replan', {
@@ -441,6 +524,7 @@ export default function App() {
         onDelete={(id) => {
           setTests((prev) => prev.filter((t) => t.id !== id))
           setSelectedId((cur) => (cur === id ? null : cur))
+          deleteTaskRemote(id)
         }}
       />
 

@@ -1,5 +1,6 @@
 import express from 'express'
 import { mountStatic } from './static.js'
+import { listTasks, getTask, upsertTask, deleteTask, dbReady } from './db.js'
 
 const app = express()
 app.use(express.json({ limit: '2mb' }))
@@ -25,10 +26,54 @@ app.get('/api/health', (_req, res) => {
     ok: true,
     fireworks: Boolean(FIREWORKS_API_KEY),
     firecrawl: Boolean(FIRECRAWL_API_KEY),
+    db: dbReady,
     actModel: FIREWORKS_ACT_MODEL,
     planModel: FIREWORKS_PLAN_MODEL,
     planReasoning: FIREWORKS_PLAN_REASONING,
   })
+})
+
+app.get('/api/tasks', async (_req, res) => {
+  try {
+    const tasks = await listTasks()
+    res.json({ tasks })
+  } catch (err) {
+    console.error('list tasks error:', err)
+    res.status(500).json({ error: String(err.message || err) })
+  }
+})
+
+app.get('/api/tasks/:id', async (req, res) => {
+  try {
+    const task = await getTask(req.params.id)
+    if (!task) return res.status(404).json({ error: 'not found' })
+    res.json({ task })
+  } catch (err) {
+    console.error('get task error:', err)
+    res.status(500).json({ error: String(err.message || err) })
+  }
+})
+
+app.put('/api/tasks/:id', async (req, res) => {
+  try {
+    const body = req.body || {}
+    const task = { ...body, id: req.params.id }
+    const saved = await upsertTask(task)
+    res.json({ task: saved })
+  } catch (err) {
+    console.error('upsert task error:', err)
+    res.status(500).json({ error: String(err.message || err) })
+  }
+})
+
+app.delete('/api/tasks/:id', async (req, res) => {
+  try {
+    const ok = await deleteTask(req.params.id)
+    res.json({ ok })
+  } catch (err) {
+    console.error('delete task error:', err)
+    res.status(500).json({ error: String(err.message || err) })
+  }
 })
 
 const PLAN_SYSTEM = `You are an expert end-to-end test planner.

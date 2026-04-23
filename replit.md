@@ -21,8 +21,16 @@ was empty on import, so this is a fresh scaffold.
 - Vite is configured with `allowedHosts: true` for the Replit proxy.
 
 ## Layout (additions)
-- `server/index.js` — Express API: `POST /api/plan`, `POST /api/run`, `GET /api/health`
+- `server/index.js` — Express API: `POST /api/plan`, `POST /api/run`, `GET /api/health`,
+  plus task persistence: `GET /api/tasks`, `GET/PUT/DELETE /api/tasks/:id`
+- `server/db.js` — Postgres pool + `tasks` table CRUD (id, name, prompt, status, JSONB data)
 - `server/static.js` — serves `dist/` in production
+
+## Persistence
+- Replit's built-in PostgreSQL stores all tasks in the `tasks` table.
+- Frontend loads history from `/api/tasks` on mount and PUTs the full task
+  (minus the ephemeral live `stage` frame) on each meaningful state change.
+- Deletes propagate to the server.
 
 ## Secrets required
 - `FIREWORKS_API_KEY`
