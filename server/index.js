@@ -293,6 +293,73 @@ app.post('/api/plan', async (req, res) => {
   }
 })
 
+// Re-plan the *remaining* actions from the current page state. Used when a run
+// failed mid-way: the client posts the original goal/plan + the URL the run
+// stopped on; we scrape that page, then ask the planner to author a fresh plan
+// that starts at that URL and finishes the user's original intent.
+app.post('/api/replan', async (req, res) => {
+  try {
+    if (!FIREWORKS_API_KEY) return res.status(400).json({ error: 'FIREWORKS_API_KEY missing' })
+    if (!FIRECRAWL_API_KEY) return res.status(400).json({ error: 'FIRECRAWL_API_KEY missing' })
+    const { prompt, plan: priorPlan, currentUrl, failedAt } = req.body || {}
+    if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt required' })
+    const startUrl = currentUrl || priorPlan?.url
+    if (!startUrl) return res.status(400).json({ error: 'currentUrl or plan.url required' })
+
+    // Grab a quick HTML snapshot of where we stopped so the planner can pick real selectors.
+    let html = ''
+    try {
+      const r = await fetch('https://api.firecrawl.dev/v1/scrape', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
+        body: JSON.stringify({ url: startUrl, formats: ['html'], onlyMainContent: false, waitFor: 600, timeout: 45000 }),
+      })
+      const d = await r.json().catch(() => ({}))
+      html = String(d?.data?.html || d?.html || '').slice(0, 18000)
+    } catch {}
+
+    const completedSteps = (priorPlan?.actions || [])
+      .slice(0, Math.max(0, Number(failedAt) || 0))
+      .map((a, i) => `${i + 1}. ${describeAction(a)}`)
+      .join('\n') || '(none)'
+    const remaining = (priorPlan?.actions || [])
+      .slice(Math.max(0, Number(failedAt) || 0))
+      .map((a, i) => `${i + 1}. ${describeAction(a)}`)
+      .join('\n') || '(none)'
+
+    const usr = `Original user goal:
+${prompt}
+
+The previous run started at ${priorPlan?.url || startUrl} and stopped at ${startUrl}.
+
+Steps that completed successfully:
+${completedSteps}
+
+Steps that did NOT run / failed:
+${remaining}
+
+Current page HTML at ${startUrl} (truncated):
+${html}
+
+Build a fresh plan that:
+- Uses url: "${startUrl}" as the starting point (do not re-do completed steps).
+- Picks selectors that actually exist in the HTML above (text= selectors and attribute selectors preferred).
+- Finishes the original user goal end-to-end.
+- Keeps actions <= 12.`
+
+    const raw = await callFireworks(
+      [{ role: 'system', content: PLAN_SYSTEM }, { role: 'user', content: usr }],
+      { temperature: 0.2, json: true, max_tokens: 2048 }
+    )
+    const plan = parsePlan(raw)
+    plan.url = startUrl // hard-pin start URL
+    res.json({ plan })
+  } catch (err) {
+    console.error('replan error:', err)
+    res.status(500).json({ error: String(err.message || err) })
+  }
+})
+
 function describeAction(a) {
   switch (a.type) {
     case 'wait':       return `wait ${a.milliseconds || 0}ms`

@@ -378,6 +378,55 @@ export default function App() {
     await planAndRun(prompt)
   }
 
+  async function replanFromHere() {
+    if (!selected || busy) return
+    const prompt = selected.actPrompt || selected.prompt
+    const id = uid()
+    const baseName = (selected.name || prompt).replace(/\s*·\s*replan.*$/i, '')
+    const draftTest = {
+      id,
+      name: `${baseName} · replan`,
+      prompt,
+      actPrompt: selected.actPrompt || null,
+      status: 'planning',
+      url: null,
+      actions: [],
+      expect: [],
+      stepDescriptions: [],
+      screenshots: [],
+      expectations: [],
+      finalUrl: null,
+      title: '',
+      duration: null,
+      error: null,
+      log: `Replanning from ${selected.finalUrl || selected.url || '(unknown)'}…\n`,
+    }
+    setTests((prev) => [draftTest, ...prev])
+    setSelectedId(id)
+    setBusy(true)
+    let plan
+    try {
+      const r = await fetch('/api/replan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt,
+          plan: { url: selected.url, actions: selected.actions || [], expect: selected.expect || [] },
+          currentUrl: selected.finalUrl || selected.url,
+          failedAt: typeof selected.failedAt === 'number' ? selected.failedAt : (selected.actions?.length || 0),
+        }),
+      })
+      const data = await readJson(r)
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
+      plan = data.plan
+    } catch (err) {
+      update(id, { status: 'fail', error: String(err.message || err), log: draftTest.log + `\nReplan failed: ${err.message || err}\n` })
+      setBusy(false)
+      return
+    }
+    await executePlannedRun(id, plan, draftTest.name)
+  }
+
   function newTask() { setSelectedId(null); setDraft('') }
 
   return (
@@ -405,7 +454,12 @@ export default function App() {
           </div>
           <div className="top-actions">
             {selected && !busy && selected.status !== 'planning' && selected.status !== 'running' && selected.status !== 'clarifying' && (
-              <button className="btn primary" onClick={rerun}>Re-run</button>
+              <>
+                {selected.status === 'fail' && (selected.finalUrl || selected.url) && (
+                  <button className="btn ghost" onClick={replanFromHere} title="Replan the remaining steps from where this run stopped">Replan from here</button>
+                )}
+                <button className="btn primary" onClick={rerun}>Re-run</button>
+              </>
             )}
             {busy && (
               <span className="btn ghost" style={{ cursor: 'default' }}>
