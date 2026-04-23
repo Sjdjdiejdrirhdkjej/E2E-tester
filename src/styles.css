@@ -591,14 +591,12 @@ button { font-family: inherit; }
   background: #0a0c0f;
   overflow: hidden;
 }
-.stage-canvas {
+.stage-img {
   position: absolute; inset: 0;
   width: 100%; height: 100%;
+  object-fit: contain;
+  object-position: top center;
   background: #fff;
-  opacity: 0;
-}
-.stage-canvas.ready {
-  opacity: 1;
   animation: stageFade 280ms ease-out;
 }
 @keyframes stageFade {

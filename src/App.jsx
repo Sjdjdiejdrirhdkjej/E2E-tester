@@ -663,7 +663,7 @@ function LiveStage({ stage, status }) {
       </div>
       <div className="stage-frame">
         {frameSrc ? (
-          <FrameCanvas src={frameSrc} alt="live browser stream frame" />
+          <FrameImage src={frameSrc} alt="live browser stream frame" />
         ) : (
           <div className="stage-blank">
             <div className="loader" />
@@ -685,54 +685,26 @@ function LiveStage({ stage, status }) {
   )
 }
 
-function FrameCanvas({ src, alt }) {
-  const canvasRef = useRef(null)
-  const [ready, setReady] = useState(false)
+function FrameImage({ src, alt }) {
+  const [lastGoodSrc, setLastGoodSrc] = useState(null)
   const [failed, setFailed] = useState(false)
 
   useEffect(() => {
     if (!src) return
-    let cancelled = false
-    const img = new Image()
-    img.decoding = 'async'
-
-    img.onload = () => {
-      if (cancelled) return
-      const canvas = canvasRef.current
-      if (!canvas) return
-      const ctx = canvas.getContext('2d')
-      if (!ctx) return
-
-      const width = img.naturalWidth || 1280
-      const height = img.naturalHeight || 800
-      if (canvas.width !== width) canvas.width = width
-      if (canvas.height !== height) canvas.height = height
-
-      ctx.clearRect(0, 0, width, height)
-      ctx.drawImage(img, 0, 0, width, height)
-      setReady(true)
-      setFailed(false)
-    }
-
-    img.onerror = () => {
-      if (cancelled) return
-      // Keep the last good frame on-screen instead of blinking to empty.
-      setFailed(true)
-    }
-
-    img.src = src
-    return () => { cancelled = true }
+    setLastGoodSrc(src)
+    setFailed(false)
   }, [src])
 
   return (
     <>
-      <canvas
-        ref={canvasRef}
-        className={`stage-canvas ${ready ? 'ready' : ''}`}
-        role="img"
-        aria-label={alt}
-      />
-      {!ready && (
+      {lastGoodSrc ? (
+        <img
+          className="stage-img"
+          src={lastGoodSrc}
+          alt={alt}
+          onError={() => setFailed(true)}
+        />
+      ) : (
         <div className="stage-blank">
           <div className="loader" />
           <div className="stage-blank-text">waiting for first frame…</div>
