@@ -562,6 +562,24 @@ export default function App() {
             <div className="hero">
               <h1 className="hello">Hello, <span className="accent">what shall we test today?</span></h1>
               <p className="subhello">Just describe it, and consider it done.</p>
+              <div className="examples">
+                {[
+                  'Open duckduckgo.com, search for "Replit Agent", verify a result mentions Replit',
+                  'Go to news.ycombinator.com and verify the top story title is non-empty',
+                  'On example.com, click "More information…" and confirm the URL changes to iana.org',
+                  'Sign up on demoqa.com/automation-practice-form with placeholder data and submit',
+                ].map((ex) => (
+                  <button
+                    key={ex}
+                    className="example-chip"
+                    onClick={() => !busy && planAndRun(ex)}
+                    disabled={busy}
+                    title="Try this scenario"
+                  >
+                    {ex}
+                  </button>
+                ))}
+              </div>
               <PromptBox
                 value={draft}
                 onChange={setDraft}
