@@ -116,6 +116,24 @@ export default function App() {
             stage: { ...(t.stage || {}), image: p.image, actionIndex: p.actionIndex }
           } : t))
         },
+        summary_start: (p) => {
+          setTests((prev) => prev.map((t) => t.id === id ? {
+            ...t,
+            status: p.passed ? 'pass' : 'fail',
+            duration: p.durationMs,
+            expectations: p.expectations || [],
+            finalUrl: p.finalUrl,
+            title: p.title,
+            summary: '',
+            summaryStreaming: true,
+            stage: t.stage ? { ...t.stage, label: p.passed ? 'done' : 'failed', finished: true } : null,
+          } : t))
+        },
+        summary_delta: (p) => {
+          setTests((prev) => prev.map((t) => t.id === id
+            ? { ...t, summary: (t.summary || '') + (p.delta || '') }
+            : t))
+        },
         done: (p) => {
           setTests((prev) => prev.map((t) => t.id === id ? {
             ...t,
@@ -125,7 +143,8 @@ export default function App() {
             expectations: p.expectations || [],
             finalUrl: p.finalUrl,
             title: p.title,
-            summary: p.summary,
+            summary: p.summary || t.summary,
+            summaryStreaming: false,
             stage: {
               image: (p.screenshots && p.screenshots[p.screenshots.length - 1]) || t.stage?.image || null,
               cursor: t.stage?.cursor || { x: 0.5, y: 0.5 },
@@ -468,10 +487,13 @@ export default function App() {
                 </div>
               )}
 
-              {selected.summary && selected.status !== 'running' && selected.status !== 'planning' && selected.status !== 'clarifying' && (
+              {(selected.summary || selected.summaryStreaming) && selected.status !== 'running' && selected.status !== 'planning' && selected.status !== 'clarifying' && (
                 <div className="bubble">
                   <div className="who">Summary · act model</div>
-                  <div className="body" style={{ marginTop: 8, lineHeight: 1.55 }}>{selected.summary}</div>
+                  <div className="body" style={{ marginTop: 8, lineHeight: 1.55 }}>
+                    {selected.summary}
+                    {selected.summaryStreaming && <span className="type-caret" />}
+                  </div>
                 </div>
               )}
 

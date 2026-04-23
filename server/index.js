@@ -449,6 +449,85 @@ function buildStreamingActions(planActions) {
   return { actions: out, frameMap }
 }
 
+async function streamFireworks(messages, onDelta, { temperature = 0.3, model, max_tokens = 600 } = {}) {
+  const body = {
+    model: model || FIREWORKS_ACT_MODEL,
+    max_tokens,
+    temperature,
+    messages,
+    stream: true,
+  }
+  const r = await fetch('https://api.fireworks.ai/inference/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${FIREWORKS_API_KEY}`,
+      Accept: 'text/event-stream',
+    },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok || !r.body) {
+    const t = await r.text().catch(() => '')
+    throw new Error(`Fireworks stream ${r.status}: ${t.slice(0, 300)}`)
+  }
+  const reader = r.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  let full = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let idx
+    while ((idx = buf.indexOf('\n')) !== -1) {
+      const line = buf.slice(0, idx).trim()
+      buf = buf.slice(idx + 1)
+      if (!line || !line.startsWith('data:')) continue
+      const data = line.slice(5).trim()
+      if (data === '[DONE]') return full
+      try {
+        const j = JSON.parse(data)
+        const delta = j.choices?.[0]?.delta?.content || ''
+        if (delta) {
+          full += delta
+          onDelta(delta)
+        }
+      } catch { /* skip non-JSON keepalives */ }
+    }
+  }
+  return full
+}
+
+async function streamSummaryRun({ plan, finalUrl, title, expectations, passed, durationMs }, onDelta) {
+  if (!FIREWORKS_API_KEY) {
+    const verdict = passed ? 'passed' : 'failed'
+    const msg = `Test ${verdict} in ${durationMs}ms. Final page: ${title || finalUrl}.`
+    onDelta(msg)
+    return msg
+  }
+  const sys = `You write a concise 2-4 sentence post-run summary of an automated end-to-end browser test. Plain prose, no markdown, no preamble. Mention what was tested, the outcome (pass/fail), and any notable assertion. Do not invent details.`
+  const usr =
+    `Scenario: ${plan.name}\n` +
+    `Start URL: ${plan.url}\n` +
+    `Final URL: ${finalUrl}\n` +
+    `Page title: ${title || '(none)'}\n` +
+    `Duration: ${durationMs}ms\n` +
+    `Outcome: ${passed ? 'PASSED' : 'FAILED'}\n` +
+    `Assertions: ${JSON.stringify(expectations)}\n`
+  try {
+    return await streamFireworks(
+      [{ role: 'system', content: sys }, { role: 'user', content: usr }],
+      onDelta,
+      { temperature: 0.3 }
+    )
+  } catch {
+    const verdict = passed ? 'passed' : 'failed'
+    const msg = `Test ${verdict} in ${durationMs}ms. Final page: ${title || finalUrl}.`
+    onDelta(msg)
+    return msg
+  }
+}
+
 async function summarizeRun({ plan, finalUrl, title, expectations, passed, durationMs }) {
   if (!FIREWORKS_API_KEY) {
     const verdict = passed ? 'passed' : 'failed'
@@ -526,10 +605,15 @@ app.post('/api/run-stream', async (req, res) => {
       } catch { /* preview is best-effort */ }
     })()
 
-    // Heartbeat so the cursor label keeps changing while Firecrawl runs the full plan
+    // Periodic browser preview while Firecrawl is running the full plan.
+    // Each tick fires a fast screenshot-only call against the start URL so the
+    // live view actually changes (catches dynamic content, ads, animations,
+    // any client-side updates) instead of staying frozen on a single frame.
     const phrases = ['analysing DOM', 'locating elements', 'preparing actions', 'executing plan', 'awaiting response']
     let hbIdx = 0
-    const heartbeat = setInterval(() => {
+    let previewBusy = false
+    let cancelled = false
+    const heartbeat = setInterval(async () => {
       try {
         send('cursor', {
           actionIndex: -1,
@@ -538,7 +622,27 @@ app.post('/api/run-stream', async (req, res) => {
           label: phrases[hbIdx++ % phrases.length],
         })
       } catch {}
-    }, 2200)
+      if (previewBusy || cancelled) return
+      previewBusy = true
+      try {
+        const pr = await fetch('https://api.firecrawl.dev/v1/scrape', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
+          body: JSON.stringify({
+            url: plan.url,
+            formats: ['screenshot'],
+            onlyMainContent: false,
+            waitFor: 200,
+            timeout: 20000,
+          }),
+        })
+        const pt = await pr.text()
+        const pd = JSON.parse(pt)
+        const shot = pd?.data?.screenshot || pd?.screenshot
+        if (shot && !cancelled) send('frame', { actionIndex: -1, image: shot, preview: true })
+      } catch { /* best effort */ }
+      previewBusy = false
+    }, 4000)
 
     const body = {
       url: plan.url,
@@ -553,6 +657,7 @@ app.post('/api/run-stream', async (req, res) => {
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
       body: JSON.stringify(body),
     })
+    cancelled = true
     clearInterval(heartbeat)
     await previewPromise.catch(() => {})
     const text = await r.text()
@@ -610,8 +715,11 @@ app.post('/api/run-stream', async (req, res) => {
     if (scrape.screenshot) screenshots.push(scrape.screenshot)
     for (const s of shots) screenshots.push(s)
 
-    const summary = await summarizeRun({ plan, finalUrl, title, expectations, passed, durationMs })
-
+    send('summary_start', { passed, expectations, finalUrl, title, durationMs })
+    const summary = await streamSummaryRun(
+      { plan, finalUrl, title, expectations, passed, durationMs },
+      (delta) => send('summary_delta', { delta })
+    )
     send('done', { summary, expectations, passed, finalUrl, title, durationMs, screenshots })
     res.end()
   } catch (err) {
