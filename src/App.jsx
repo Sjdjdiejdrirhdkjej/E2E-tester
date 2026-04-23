@@ -117,7 +117,8 @@ export default function App() {
           } : t))
         },
         done: (p) => {
-          update(id, {
+          setTests((prev) => prev.map((t) => t.id === id ? {
+            ...t,
             status: p.passed ? 'pass' : 'fail',
             duration: p.durationMs,
             screenshots: p.screenshots || [],
@@ -125,16 +126,23 @@ export default function App() {
             finalUrl: p.finalUrl,
             title: p.title,
             summary: p.summary,
-            stage: null,
-          })
+            stage: {
+              image: (p.screenshots && p.screenshots[p.screenshots.length - 1]) || t.stage?.image || null,
+              cursor: t.stage?.cursor || { x: 0.5, y: 0.5 },
+              label: p.passed ? 'done' : 'failed',
+              actionIndex: -1,
+              finished: true,
+            },
+          } : t))
         },
         error: (p) => {
-          update(id, {
+          setTests((prev) => prev.map((t) => t.id === id ? {
+            ...t,
             status: 'fail',
             error: p.error,
             summary: null,
-            stage: null,
-          })
+            stage: t.stage ? { ...t.stage, label: 'error', finished: true } : null,
+          } : t))
         },
       })
     } catch (err) {
@@ -446,7 +454,7 @@ export default function App() {
                 </div>
               )}
 
-              {(selected.status === 'running' || selected.status === 'planning') && (
+              {(selected.stage || selected.status === 'running' || selected.status === 'planning') && (
                 <LiveStage
                   stage={selected.stage}
                   status={selected.status}
@@ -477,19 +485,6 @@ export default function App() {
                         <span className="label">{e.kind}: {e.value}</span>
                         <span className="tag">{e.pass ? 'pass' : 'fail'}</span>
                       </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {selected.screenshots?.length > 0 && selected.status !== 'running' && (
-                <div className="bubble">
-                  <div className="who">Frames · Firecrawl</div>
-                  <div className="shots">
-                    {selected.screenshots.map((src, i) => (
-                      <a key={i} href={src} target="_blank" rel="noreferrer" className="shot">
-                        <img src={src} alt={`Screenshot ${i + 1}`} loading="lazy" />
-                      </a>
                     ))}
                   </div>
                 </div>

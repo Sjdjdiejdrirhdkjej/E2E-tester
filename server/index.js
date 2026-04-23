@@ -546,14 +546,14 @@ app.post('/api/run-stream', async (req, res) => {
                : action.type === 'scroll' ? `scroll ${action.direction || 'down'}`
                : action.type,
         })
-        await sleep(550)
+        await sleep(220)
       } else {
         send('cursor', { actionIndex: -1, x: 0.5, y: 0.5, label: 'loading page' })
-        await sleep(250)
+        await sleep(120)
       }
 
       send('frame', { actionIndex: f.actionIndex, image: img })
-      await sleep(350)
+      await sleep(140)
     }
 
     const durationMs = Date.now() - start
