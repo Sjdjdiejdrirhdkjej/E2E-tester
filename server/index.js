@@ -627,22 +627,45 @@ async function summarizeRun({ plan, finalUrl, title, expectations, passed, durat
 }
 
 app.post('/api/run-stream', async (req, res) => {
+  // --- Streaming hardening ---
+  // The combination of Replit's https proxy + Vite's dev http-proxy + Node's
+  // default TCP Nagle coalescing can make SSE look "one big response at the
+  // end" even though we're writing events progressively. The settings below
+  // defeat every buffer we know about on that path.
   res.set({
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
-    'X-Accel-Buffering': 'no',
+    'X-Accel-Buffering': 'no',          // nginx / GCP L7
+    'Content-Encoding': 'identity',     // forbid any on-the-fly gzip
   })
+  // Turn off Nagle so each res.write() is flushed as its own TCP segment.
+  try { req.socket?.setNoDelay?.(true) } catch {}
+  try { req.socket?.setKeepAlive?.(true, 15000) } catch {}
+  // Some proxies keep a small read buffer (~2-4KB) before they emit anything.
+  // A 2KB comment pre-amble guarantees the client sees bytes immediately.
   res.flushHeaders?.()
+  res.write(`: ${' '.repeat(2048)}\n\n`)
+
   const send = (event, data) => {
     res.write(`event: ${event}\n`)
     res.write(`data: ${JSON.stringify(data)}\n\n`)
   }
 
+  // Heartbeat comment every 10s so intermediaries don't time out or buffer
+  // during the occasional slow Firecrawl step. SSE clients ignore `:` lines.
+  const heartbeat = setInterval(() => {
+    try { res.write(`: hb ${Date.now()}\n\n`) } catch {}
+  }, 10000)
+  const clientGone = () => { clearInterval(heartbeat) }
+  req.on('close', clientGone)
+  res.on('close', clientGone)
+  const end = () => { clearInterval(heartbeat); try { res.end() } catch {} }
+
   try {
-    if (!FIRECRAWL_API_KEY) { send('error', { error: 'FIRECRAWL_API_KEY missing' }); return res.end() }
+    if (!FIRECRAWL_API_KEY) { send('error', { error: 'FIRECRAWL_API_KEY missing' }); return end() }
     const { plan } = req.body || {}
-    if (!plan || !plan.url) { send('error', { error: 'plan with url required' }); return res.end() }
+    if (!plan || !plan.url) { send('error', { error: 'plan with url required' }); return end() }
 
     send('start', { url: plan.url, totalActions: plan.actions.length })
     const start = Date.now()
@@ -860,11 +883,11 @@ ${trimmedHtml}`
       (delta) => send('summary_delta', { delta })
     )
     send('done', { summary, expectations, passed, finalUrl, title, durationMs, screenshots: lastShot ? [lastShot] : [] })
-    res.end()
+    end()
   } catch (err) {
     console.error('run-stream error:', err)
     try { send('error', { error: String(err.message || err) }) } catch {}
-    res.end()
+    end()
   }
 })
 
