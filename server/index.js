@@ -61,7 +61,11 @@ CRITICAL RULES (Firecrawl semantics):
 - After typing into a form, use { "type": "press", "key": "Enter" } or click the submit button.
 - Insert a small { "type": "wait", "milliseconds": 800 } after navigation/clicks that load content.
 - Always end with a { "type": "screenshot" } so the user gets a visual verdict.
-- Prefer stable selectors (id, name, aria-label, role, button text via attribute). Avoid brittle nth-child chains.
+- SELECTOR STRATEGY (very important — you cannot see the page, so prefer resilient selectors):
+  * For buttons / links / labels: use Playwright text-engine selectors: "text=Sign in", "text=/^Search/i", or "text='Buy now'" for exact match. These match by visible text and are far more reliable than CSS.
+  * For inputs: prefer attribute selectors like "input[name='q']", "input[type='email']", "[aria-label='Search']", "[placeholder*='Search']".
+  * Use stable ids ("#search") only when the user names them. Avoid nth-child / long descendant chains.
+  * NEVER invent class names. If unsure of a selector, use a text= selector based on the visible label.
 - If the user did not specify a site, choose a sensible public site (https://example.com, https://duckduckgo.com for search, https://news.ycombinator.com for HN).
 - Never invent real credentials. Use placeholders like "demo@example.com" / "password123".
 - Output JSON only.`
@@ -313,7 +317,8 @@ function sanitizeAction(a) {
       return [{ type: 'wait', milliseconds: Math.max(50, Number(a.milliseconds) || 500) }]
     }
     case 'click': {
-      const sel = String(a.selector || '').trim()
+      let sel = String(a.selector || '').trim()
+      if (!sel && a.text) sel = `text=${String(a.text).trim()}`
       return sel ? [{ type: 'click', selector: sel }] : []
     }
     case 'write': {
@@ -647,19 +652,44 @@ app.post('/api/run-stream', async (req, res) => {
         send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label })
 
         replay.push(sa)
+        // Insert a small wait before clicks/writes/presses for resilience on slow pages.
+        const needsWait = sa.type === 'click' || sa.type === 'write' || sa.type === 'press'
+        const stepActions = [
+          ...replay.slice(0, -1),
+          ...(needsWait ? [{ type: 'wait', milliseconds: 600 }] : []),
+          sa,
+          { type: 'wait', milliseconds: 400 },
+          { type: 'screenshot' },
+        ]
+        const isLast = i === plan.actions.length - 1
+        const formats = isLast ? ['markdown', 'html', 'screenshot'] : ['screenshot']
+        let ok = false
         try {
-          const stepActions = [...replay, { type: 'wait', milliseconds: 400 }, { type: 'screenshot' }]
-          const isLast = i === plan.actions.length - 1
-          const formats = isLast ? ['markdown', 'html', 'screenshot'] : ['screenshot']
           const scrape = await fcScrape({ url: plan.url, actions: stepActions, formats, onlyMain: false })
           lastScrape = scrape
           const shot = pickScreenshot(scrape)
-          if (shot) {
-            lastShot = shot
-            send('frame', { image: shot, actionIndex: i })
-          }
+          if (shot) { lastShot = shot; send('frame', { image: shot, actionIndex: i }) }
+          ok = true
         } catch (err) {
-          send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `! ${label} failed: ${String(err.message || err).slice(0, 80)}` })
+          // First retry: same action with a longer wait, in case the element wasn't ready.
+          try {
+            const retry = [
+              ...replay.slice(0, -1),
+              { type: 'wait', milliseconds: 1500 },
+              sa,
+              { type: 'wait', milliseconds: 600 },
+              { type: 'screenshot' },
+            ]
+            const scrape = await fcScrape({ url: plan.url, actions: retry, formats, onlyMain: false })
+            lastScrape = scrape
+            const shot = pickScreenshot(scrape)
+            if (shot) { lastShot = shot; send('frame', { image: shot, actionIndex: i }) }
+            ok = true
+          } catch (err2) {
+            // Drop the failed action from replay so subsequent steps still run from last good state.
+            replay.pop()
+            send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `! ${label} skipped: ${String(err2.message || err2).slice(0, 80)}` })
+          }
         }
         await sleep(120)
       }
