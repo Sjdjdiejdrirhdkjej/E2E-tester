@@ -224,6 +224,189 @@ function evaluateExpectations(plan, scrape) {
   return results
 }
 
+// ----- Streaming run with progressive frames + animated cursor -----
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)) }
+
+// Heuristic cursor position (normalized 0..1) for a given action.
+// We don't get real coords from Firecrawl, so we pick plausible zones
+// based on the selector / action type so the cursor moves believably.
+function estimateCursor(action, prev) {
+  const sel = String(action?.selector || '').toLowerCase()
+  const txt = String(action?.text || '').toLowerCase()
+  const rand = (a, b) => a + Math.random() * (b - a)
+
+  if (action.type === 'write' || action.type === 'press') {
+    // Stay roughly where we last clicked (the input we focused).
+    return prev || { x: 0.5, y: 0.32 }
+  }
+  if (action.type === 'scroll') {
+    return { x: 0.92, y: action.direction === 'up' ? 0.15 : 0.85 }
+  }
+  if (action.type === 'screenshot' || action.type === 'scrape' || action.type === 'wait') {
+    return prev || { x: 0.5, y: 0.5 }
+  }
+  // click / generic: pick a zone based on selector hints.
+  if (/(search|q\b|input\[type=.?search|name=.?q)/.test(sel)) return { x: rand(0.35, 0.65), y: rand(0.22, 0.34) }
+  if (/(submit|button|btn|sign[-_ ]?in|login|cta|continue|next)/.test(sel) || /(submit|continue|next|search)/.test(txt)) {
+    return { x: rand(0.4, 0.6), y: rand(0.42, 0.58) }
+  }
+  if (/(nav|menu|header|top|logo)/.test(sel)) return { x: rand(0.15, 0.85), y: rand(0.05, 0.12) }
+  if (/(footer|bottom)/.test(sel)) return { x: rand(0.2, 0.8), y: rand(0.88, 0.95) }
+  if (/(link|a\b|article|item|result)/.test(sel)) return { x: rand(0.2, 0.7), y: rand(0.35, 0.7) }
+  return { x: rand(0.3, 0.7), y: rand(0.3, 0.7) }
+}
+
+// Build Firecrawl actions with a `screenshot` after every interactive action,
+// and a `screenshot` first so we have a frame for the initial page load.
+function buildStreamingActions(planActions) {
+  const out = [{ type: 'screenshot' }]
+  const frameMap = [{ kind: 'initial', actionIndex: -1 }]
+
+  for (let i = 0; i < planActions.length; i++) {
+    const a = planActions[i]
+    const sanitized = sanitizeAction(a)
+    for (const sa of sanitized) {
+      out.push(sa)
+      if (sa.type !== 'screenshot') {
+        out.push({ type: 'screenshot' })
+        frameMap.push({ kind: 'after', actionIndex: i })
+      } else {
+        frameMap.push({ kind: 'shot', actionIndex: i })
+      }
+    }
+  }
+  return { actions: out, frameMap }
+}
+
+async function summarizeRun({ plan, finalUrl, title, expectations, passed, durationMs }) {
+  if (!FIREWORKS_API_KEY) {
+    const verdict = passed ? 'passed' : 'failed'
+    return `Test ${verdict} in ${durationMs}ms. Final page: ${title || finalUrl}.`
+  }
+  try {
+    const sys = `You write a concise 2-4 sentence post-run summary of an automated end-to-end browser test. Plain prose, no markdown, no preamble. Mention what was tested, the outcome (pass/fail), and any notable assertion. Do not invent details.`
+    const usr =
+      `Scenario: ${plan.name}\n` +
+      `Start URL: ${plan.url}\n` +
+      `Final URL: ${finalUrl}\n` +
+      `Page title: ${title || '(none)'}\n` +
+      `Duration: ${durationMs}ms\n` +
+      `Outcome: ${passed ? 'PASSED' : 'FAILED'}\n` +
+      `Assertions: ${JSON.stringify(expectations)}\n`
+    const out = await callFireworks(
+      [{ role: 'system', content: sys }, { role: 'user', content: usr }],
+      { temperature: 0.3, json: false }
+    )
+    return out.trim()
+  } catch (err) {
+    const verdict = passed ? 'passed' : 'failed'
+    return `Test ${verdict} in ${durationMs}ms. Final page: ${title || finalUrl}.`
+  }
+}
+
+app.post('/api/run-stream', async (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  })
+  res.flushHeaders?.()
+  const send = (event, data) => {
+    res.write(`event: ${event}\n`)
+    res.write(`data: ${JSON.stringify(data)}\n\n`)
+  }
+
+  try {
+    if (!FIRECRAWL_API_KEY) { send('error', { error: 'FIRECRAWL_API_KEY missing' }); return res.end() }
+    const { plan } = req.body || {}
+    if (!plan || !plan.url) { send('error', { error: 'plan with url required' }); return res.end() }
+
+    const { actions: fcActions, frameMap } = buildStreamingActions(plan.actions)
+
+    send('start', { url: plan.url, totalActions: plan.actions.length })
+
+    const start = Date.now()
+    const body = {
+      url: plan.url,
+      formats: ['markdown', 'html', 'screenshot'],
+      onlyMainContent: false,
+      waitFor: 800,
+      timeout: 90000,
+      actions: fcActions,
+    }
+    const r = await fetch('https://api.firecrawl.dev/v1/scrape', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
+      body: JSON.stringify(body),
+    })
+    const text = await r.text()
+    let data
+    try { data = JSON.parse(text) } catch {
+      send('error', { error: `Firecrawl returned non-JSON (${r.status})` }); return res.end()
+    }
+    if (!r.ok || data.success === false) {
+      send('error', { error: `Firecrawl ${r.status}: ${data?.error || text.slice(0, 200)}` }); return res.end()
+    }
+    const scrape = data.data || data
+    const shots = (scrape.actions && scrape.actions.screenshots) || []
+    // Fallback: if no per-action shots, use the final screenshot once.
+    const fallbackShot = scrape.screenshot || null
+
+    let prevCursor = { x: 0.5, y: 0.5 }
+    let shotIdx = 0
+    for (let i = 0; i < frameMap.length; i++) {
+      const f = frameMap[i]
+      const img = shots[shotIdx++] || fallbackShot
+      if (!img) continue
+
+      if (f.actionIndex >= 0) {
+        const action = plan.actions[f.actionIndex]
+        const cursor = estimateCursor(action, prevCursor)
+        prevCursor = cursor
+        send('cursor', {
+          actionIndex: f.actionIndex,
+          action,
+          x: cursor.x,
+          y: cursor.y,
+          label: action.type === 'click' ? `click ${action.selector || ''}`
+               : action.type === 'write' ? `type "${action.text || ''}"`
+               : action.type === 'press' ? `press ${action.key || ''}`
+               : action.type === 'scroll' ? `scroll ${action.direction || 'down'}`
+               : action.type,
+        })
+        await sleep(550)
+      } else {
+        send('cursor', { actionIndex: -1, x: 0.5, y: 0.5, label: 'loading page' })
+        await sleep(250)
+      }
+
+      send('frame', { actionIndex: f.actionIndex, image: img })
+      await sleep(350)
+    }
+
+    const durationMs = Date.now() - start
+    const expectations = evaluateExpectations(plan, scrape)
+    const passed = expectations.length === 0 ? true : expectations.every((e) => e.pass)
+    const finalUrl = scrape.metadata?.sourceURL || scrape.metadata?.url || plan.url
+    const title = scrape.metadata?.title || ''
+
+    const screenshots = []
+    if (scrape.screenshot) screenshots.push(scrape.screenshot)
+    for (const s of shots) screenshots.push(s)
+
+    const summary = await summarizeRun({ plan, finalUrl, title, expectations, passed, durationMs })
+
+    send('done', { summary, expectations, passed, finalUrl, title, durationMs, screenshots })
+    res.end()
+  } catch (err) {
+    console.error('run-stream error:', err)
+    try { send('error', { error: String(err.message || err) }) } catch {}
+    res.end()
+  }
+})
+
 app.post('/api/run', async (req, res) => {
   try {
     if (!FIRECRAWL_API_KEY) return res.status(400).json({ error: 'FIRECRAWL_API_KEY missing' })

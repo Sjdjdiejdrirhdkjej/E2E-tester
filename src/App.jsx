@@ -31,6 +31,40 @@ function describeAction(a) {
   }
 }
 
+async function streamRun(plan, handlers) {
+  const r = await fetch('/api/run-stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ plan }),
+  })
+  if (!r.ok || !r.body) {
+    const t = await r.text().catch(() => '')
+    throw new Error(t || `HTTP ${r.status}`)
+  }
+  const reader = r.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let idx
+    while ((idx = buf.indexOf('\n\n')) !== -1) {
+      const raw = buf.slice(0, idx)
+      buf = buf.slice(idx + 2)
+      let event = 'message'; let data = ''
+      for (const line of raw.split('\n')) {
+        if (line.startsWith('event: ')) event = line.slice(7).trim()
+        else if (line.startsWith('data: ')) data += line.slice(6)
+      }
+      if (!data) continue
+      let payload
+      try { payload = JSON.parse(data) } catch { continue }
+      handlers[event]?.(payload)
+    }
+  }
+}
+
 export default function App() {
   const [tests, setTests] = useState([])
   const [selectedId, setSelectedId] = useState(null)
@@ -101,47 +135,54 @@ export default function App() {
       actions: plan.actions,
       expect: plan.expect,
       stepDescriptions: plan.actions.map(describeAction),
-      log: `Plan from Kimi K2:\n  url: ${plan.url}\n  actions: ${plan.actions.length}\n  expectations: ${plan.expect.length}\n\nDispatching to Firecrawl…\n`,
+      log: '',
+      stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'preparing browser…', actionIndex: -1 },
+      summary: null,
     })
 
-    const start = performance.now()
     try {
-      const r = await fetch('/api/run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ plan }),
-      })
-      const data = await readJson(r)
-      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
-      const duration = data.durationMs ?? Math.round(performance.now() - start)
-      const okText = data.passed ? 'PASSED' : 'FAILED (assertion)'
-      update(id, {
-        status: data.passed ? 'pass' : 'fail',
-        duration,
-        screenshots: data.screenshots || [],
-        expectations: data.expectations || [],
-        finalUrl: data.finalUrl,
-        title: data.title,
-        log:
-          `Plan from Kimi K2:\n  url: ${plan.url}\n  actions: ${plan.actions.length}\n\n` +
-          `Firecrawl executed in ${duration}ms\n` +
-          `Final URL: ${data.finalUrl}\n` +
-          `Title: ${data.title || '(none)'}\n` +
-          `Screenshots: ${(data.screenshots || []).length}\n\n` +
-          (data.expectations || [])
-            .map((e) => `  ${e.pass ? '✔' : '✖'} ${e.kind}: ${e.value}`)
-            .join('\n') +
-          `\n\n${okText}\n`,
+      await streamRun(plan, {
+        start: () => {
+          update(id, { stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'opening page…', actionIndex: -1 } })
+        },
+        cursor: (p) => {
+          setTests((prev) => prev.map((t) => t.id === id ? {
+            ...t,
+            stage: { ...(t.stage || {}), cursor: { x: p.x, y: p.y }, label: p.label, actionIndex: p.actionIndex }
+          } : t))
+        },
+        frame: (p) => {
+          setTests((prev) => prev.map((t) => t.id === id ? {
+            ...t,
+            stage: { ...(t.stage || {}), image: p.image, actionIndex: p.actionIndex }
+          } : t))
+        },
+        done: (p) => {
+          update(id, {
+            status: p.passed ? 'pass' : 'fail',
+            duration: p.durationMs,
+            screenshots: p.screenshots || [],
+            expectations: p.expectations || [],
+            finalUrl: p.finalUrl,
+            title: p.title,
+            summary: p.summary,
+            stage: null,
+          })
+        },
+        error: (p) => {
+          update(id, {
+            status: 'fail',
+            error: p.error,
+            summary: null,
+            stage: null,
+          })
+        },
       })
     } catch (err) {
-      const duration = Math.round(performance.now() - start)
       update(id, {
         status: 'fail',
-        duration,
         error: String(err.message || err),
-        log:
-          `Plan from Kimi K2:\n  url: ${plan.url}\n  actions: ${plan.actions.length}\n\n` +
-          `Firecrawl failed after ${duration}ms\n${err.message || err}\n`,
+        stage: null,
       })
     } finally {
       setBusy(false)
@@ -219,21 +260,21 @@ export default function App() {
                 )}
               </div>
 
-              {selected.actions?.length > 0 && (
+              {(selected.status === 'running' || selected.status === 'planning') && (
+                <LiveStage
+                  stage={selected.stage}
+                  status={selected.status}
+                />
+              )}
+
+              {selected.summary && selected.status !== 'running' && selected.status !== 'planning' && (
                 <div className="bubble">
-                  <div className="who">Plan · Kimi K2</div>
-                  <div className="steps" style={{ marginTop: 8 }}>
-                    {selected.actions.map((a, i) => (
-                      <div className="step" key={i}>
-                        <span className={`dot ${selected.status === 'running' ? 'running' : selected.status === 'pass' ? 'pass' : selected.status === 'fail' ? 'fail' : 'pending'}`} />
-                        <span className="label">{describeAction(a)}</span>
-                      </div>
-                    ))}
-                  </div>
+                  <div className="who">Summary · Kimi K2</div>
+                  <div className="body" style={{ marginTop: 8, lineHeight: 1.55 }}>{selected.summary}</div>
                 </div>
               )}
 
-              {selected.expectations?.length > 0 && (
+              {selected.expectations?.length > 0 && selected.status !== 'running' && (
                 <div className="bubble">
                   <div className="who">Assertions</div>
                   <div className="steps" style={{ marginTop: 8 }}>
@@ -248,9 +289,9 @@ export default function App() {
                 </div>
               )}
 
-              {selected.screenshots?.length > 0 && (
+              {selected.screenshots?.length > 0 && selected.status !== 'running' && (
                 <div className="bubble">
-                  <div className="who">Screenshots · Firecrawl</div>
+                  <div className="who">Frames · Firecrawl</div>
                   <div className="shots">
                     {selected.screenshots.map((src, i) => (
                       <a key={i} href={src} target="_blank" rel="noreferrer" className="shot">
@@ -265,13 +306,6 @@ export default function App() {
                 <div className="bubble" style={{ borderColor: '#e8c4c0' }}>
                   <div className="who" style={{ color: 'var(--fail)' }}>Error</div>
                   <div className="body" style={{ color: 'var(--fail)' }}>{selected.error}</div>
-                </div>
-              )}
-
-              {selected.log && (
-                <div className="bubble">
-                  <div className="who">Console</div>
-                  <pre className="log" style={{ marginTop: 8 }}>{selected.log}</pre>
                 </div>
               )}
             </div>
@@ -320,6 +354,45 @@ export default function App() {
           </div>
         )}
       </section>
+    </div>
+  )
+}
+
+function LiveStage({ stage, status }) {
+  const x = stage?.cursor?.x ?? 0.5
+  const y = stage?.cursor?.y ?? 0.5
+  const label = stage?.label || (status === 'planning' ? 'planning…' : 'working…')
+  return (
+    <div className="stage">
+      <div className="stage-bar">
+        <span className="stage-dots">
+          <span /><span /><span />
+        </span>
+        <span className="stage-label">
+          <span className="stage-pulse" />
+          {label}
+        </span>
+      </div>
+      <div className="stage-frame">
+        {stage?.image ? (
+          <img className="stage-img" src={stage.image} alt="live" />
+        ) : (
+          <div className="stage-blank">
+            <div className="loader" />
+            <div className="stage-blank-text">{label}</div>
+          </div>
+        )}
+        <div
+          className="ai-cursor"
+          style={{ left: `${x * 100}%`, top: `${y * 100}%` }}
+        >
+          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+            <path d="M3 2 L3 18 L8 14 L11 21 L14 20 L11 13 L18 13 Z"
+              fill="#fff" stroke="#111" strokeWidth="1.4" strokeLinejoin="round" />
+          </svg>
+          <span className="ai-cursor-tag">AI</span>
+        </div>
+      </div>
     </div>
   )
 }
