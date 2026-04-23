@@ -567,100 +567,47 @@ app.post('/api/run-stream', async (req, res) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`)
   }
 
-  let sessionId = null
+  let browser = null
+  let context = null
+  let page = null
   let frameTimer = null
   const stopFrames = () => { if (frameTimer) { clearInterval(frameTimer); frameTimer = null } }
   try {
-    if (!FIRECRAWL_API_KEY) { send('error', { error: 'FIRECRAWL_API_KEY missing' }); return res.end() }
     const { plan } = req.body || {}
     if (!plan || !plan.url) { send('error', { error: 'plan with url required' }); return res.end() }
 
     send('start', { url: plan.url, totalActions: plan.actions.length })
     const start = Date.now()
 
-    // ---- 1. Create a Browser Sandbox session for true live streaming ----
-    const createR = await fetch('https://api.firecrawl.dev/v2/browser', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
-      body: JSON.stringify({ ttl: 600, activityTtl: 180 }),
-    })
-    const createTxt = await createR.text()
-    let session
-    try { session = JSON.parse(createTxt) } catch {
-      send('error', { error: `Browser create returned non-JSON (${createR.status}): ${createTxt.slice(0, 200)}` }); return res.end()
-    }
-    if (!createR.ok || session.success === false || !session.id) {
-      send('error', { error: `Browser create ${createR.status}: ${session?.error || createTxt.slice(0, 200)}` }); return res.end()
-    }
-    sessionId = session.id
+    // ---- 1. Launch local headless Chromium via Playwright ----
+    const { chromium } = await import('playwright-chromium')
+    browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] })
+    context = await browser.newContext({ viewport: { width: 1280, height: 720 } })
+    page = await context.newPage()
 
-    // ---- 2. Helper to execute Playwright code in the session ----
-    // NOTE: Firecrawl's /v2/browser/{id}/execute response `result` field is an
-    // alias for `stdout` (string), not a structured return value. So we wrap
-    // the user code in an async IIFE, capture its return value, and emit it
-    // to stdout between a sentinel so we can recover a real JS object here.
-    const FC_BEGIN = '__FC_RES_BEGIN__'
-    const FC_END = '__FC_RES_END__'
-    async function exec(code) {
-      const wrapped =
-        `const __fc_val = await (async () => {\n${code}\n})();\n` +
-        `process.stdout.write(${JSON.stringify(FC_BEGIN)} + JSON.stringify(__fc_val === undefined ? null : __fc_val) + ${JSON.stringify(FC_END)});`
-      const er = await fetch(`https://api.firecrawl.dev/v2/browser/${sessionId}/execute`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
-        body: JSON.stringify({ code: wrapped, language: 'node' }),
-      })
-      const et = await er.text()
-      let ed
-      try { ed = JSON.parse(et) } catch { throw new Error(`exec non-JSON (${er.status}): ${et.slice(0, 200)}`) }
-      if (!er.ok || ed.success === false) {
-        throw new Error(`exec ${er.status}: ${ed?.error || ed?.stderr || et.slice(0, 200)}`)
-      }
-      const out = String(ed.stdout ?? ed.result ?? '')
-      const s = out.lastIndexOf(FC_BEGIN)
-      const e = out.lastIndexOf(FC_END)
-      if (s === -1 || e === -1 || e <= s) return null
-      try { return JSON.parse(out.slice(s + FC_BEGIN.length, e)) } catch { return null }
-    }
-
-    // ---- 2b. Live frame streaming via periodic Playwright screenshots.
-    // We capture JPEGs in the sandbox, base64-encode them there, and send them
-    // back as SSE `frame` events. No external live-view URL / iframe is used. ----
+    // ---- 2. Live frame streaming via periodic JPEG screenshots over SSE ----
     let frameActionIndex = -1
     let framesInFlight = false
-    let actionInFlight = false
     async function captureFrame() {
-      // Skip if a screenshot is already running, or if an action exec is in
-      // flight — the Firecrawl sandbox serializes execs per session, so we
-      // don't want a JPEG encode to stall the user's click/type.
-      if (framesInFlight || actionInFlight) return
+      if (framesInFlight || !page || page.isClosed()) return
       framesInFlight = true
       try {
-        const r = await exec(
-          `try {
-             const buf = await page.screenshot({ type: 'jpeg', quality: 55, fullPage: false, timeout: 4000 });
-             return { image: 'data:image/jpeg;base64,' + buf.toString('base64') };
-           } catch (e) { return { error: String(e.message || e) }; }`
-        )
-        if (r && r.image) {
-          send('frame', { image: r.image, actionIndex: frameActionIndex })
-        }
+        const buf = await page.screenshot({ type: 'jpeg', quality: 55, fullPage: false, timeout: 4000 })
+        const image = 'data:image/jpeg;base64,' + buf.toString('base64')
+        send('frame', { image, actionIndex: frameActionIndex })
       } catch { /* ignore transient screenshot errors */ } finally {
         framesInFlight = false
       }
     }
-    async function withAction(fn) {
-      actionInFlight = true
-      try { return await fn() } finally { actionInFlight = false }
-    }
-    frameTimer = setInterval(() => { captureFrame().catch(() => {}) }, 700)
+    frameTimer = setInterval(() => { captureFrame().catch(() => {}) }, 500)
 
     // ---- 3. Navigate to start URL ----
     send('cursor', { actionIndex: -1, x: 0.5, y: 0.1, label: `navigating to ${plan.url}` })
-    await withAction(() =>
-      exec(`await page.goto(${JSON.stringify(plan.url)}, { waitUntil: 'domcontentloaded', timeout: 45000 }); return { url: page.url() };`)
-    )
-    // First frame immediately so the UI has something to show.
+    try {
+      await page.goto(plan.url, { waitUntil: 'domcontentloaded', timeout: 45000 })
+    } catch (err) {
+      send('cursor', { actionIndex: -1, x: 0.5, y: 0.1, label: `! navigation issue: ${String(err.message || err).slice(0, 80)}` })
+    }
     await captureFrame()
 
     // ---- 4. Run actions one at a time, streaming a cursor event per step ----
@@ -676,21 +623,14 @@ app.post('/api/run-stream', async (req, res) => {
         else if (sa.type === 'scroll') label = `scroll ${sa.direction || 'down'}`
         else if (sa.type === 'wait') label = sa.selector ? `wait for ${sa.selector}` : `wait ${sa.milliseconds || 0}ms`
 
-        // Try to find real coordinates for click targets so the cursor overlay aligns with the live view.
+        // Try to find real coordinates for click targets so the overlay aligns with the live view.
         let cursor = estimateCursor(a, prev)
         if (sa.type === 'click' && sa.selector) {
           try {
-            const r = await exec(
-              `try {
-                 const loc = page.locator(${JSON.stringify(sa.selector)}).first();
-                 await loc.waitFor({ timeout: 5000, state: 'visible' });
-                 const b = await loc.boundingBox();
-                 const vp = page.viewportSize();
-                 return { bbox: b, vp };
-               } catch (e) { return { error: String(e.message||e) }; }`
-            )
-            const vp = r?.vp || { width: 1280, height: 720 }
-            const bb = r?.bbox
+            const loc = page.locator(sa.selector).first()
+            await loc.waitFor({ timeout: 5000, state: 'visible' }).catch(() => {})
+            const bb = await loc.boundingBox().catch(() => null)
+            const vp = page.viewportSize() || { width: 1280, height: 720 }
             if (bb) cursor = {
               x: Math.max(0, Math.min(1, (bb.x + bb.width / 2) / vp.width)),
               y: Math.max(0, Math.min(1, (bb.y + bb.height / 2) / vp.height)),
@@ -703,30 +643,25 @@ app.post('/api/run-stream', async (req, res) => {
         await sleep(180)
 
         try {
-          await withAction(async () => {
-            if (sa.type === 'click') {
-              await exec(`await page.locator(${JSON.stringify(sa.selector)}).first().click({ timeout: 10000 }); return {};`)
-            } else if (sa.type === 'write') {
-              await exec(`await page.keyboard.type(${JSON.stringify(sa.text || '')}, { delay: 25 }); return {};`)
-            } else if (sa.type === 'press') {
-              await exec(`await page.keyboard.press(${JSON.stringify(sa.key || 'Enter')}); return {};`)
-            } else if (sa.type === 'wait') {
-              if (sa.selector) {
-                await exec(`await page.waitForSelector(${JSON.stringify(sa.selector)}, { timeout: 15000 }); return {};`)
-              } else {
-                await exec(`await page.waitForTimeout(${Math.max(50, Number(sa.milliseconds) || 500)}); return {};`)
-              }
-            } else if (sa.type === 'scroll') {
-              const dy = sa.direction === 'up' ? -600 : 600
-              await exec(`await page.evaluate(() => window.scrollBy(0, ${dy})); return {};`)
-            } else if (sa.type === 'screenshot' || sa.type === 'scrape') {
-              // No-op: frames are streamed continuously via captureFrame().
+          if (sa.type === 'click') {
+            await page.locator(sa.selector).first().click({ timeout: 10000 })
+          } else if (sa.type === 'write') {
+            await page.keyboard.type(sa.text || '', { delay: 25 })
+          } else if (sa.type === 'press') {
+            await page.keyboard.press(sa.key || 'Enter')
+          } else if (sa.type === 'wait') {
+            if (sa.selector) {
+              await page.waitForSelector(sa.selector, { timeout: 15000 })
+            } else {
+              await page.waitForTimeout(Math.max(50, Number(sa.milliseconds) || 500))
             }
-          })
+          } else if (sa.type === 'scroll') {
+            const dy = sa.direction === 'up' ? -600 : 600
+            await page.evaluate((d) => window.scrollBy(0, d), dy)
+          }
         } catch (err) {
           send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `! ${label} failed` })
         }
-        // Force a fresh frame right after each action for snappier feedback.
         await captureFrame()
       }
     }
@@ -738,12 +673,13 @@ app.post('/api/run-stream', async (req, res) => {
     await captureFrame()
     let finalState = { url: plan.url, title: '', html: '', text: '' }
     try {
-      finalState = await exec(
-        `await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(()=>{});
-         const html = await page.content();
-         const text = await page.evaluate(() => document.body ? document.body.innerText : '');
-         return { url: page.url(), title: await page.title(), html, text };`
-      )
+      await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {})
+      finalState = {
+        url: page.url(),
+        title: await page.title().catch(() => ''),
+        html: await page.content().catch(() => ''),
+        text: await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => ''),
+      }
     } catch {}
 
     const fakeScrape = {
@@ -770,12 +706,9 @@ app.post('/api/run-stream', async (req, res) => {
     res.end()
   } finally {
     stopFrames()
-    if (sessionId) {
-      fetch(`https://api.firecrawl.dev/v2/browser/${sessionId}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
-      }).catch(() => {})
-    }
+    try { if (page && !page.isClosed()) await page.close() } catch {}
+    try { if (context) await context.close() } catch {}
+    try { if (browser) await browser.close() } catch {}
   }
 })
 
