@@ -58,11 +58,12 @@ function describeAction(a) {
   }
 }
 
-async function streamSse(url, body, handlers) {
+async function streamSse(url, body, handlers, signal) {
   const r = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal,
   })
   if (!r.ok || !r.body) {
     const t = await r.text().catch(() => '')
@@ -100,8 +101,8 @@ async function streamPlan(prompt, handlers) {
   return streamSse('/api/plan-stream', { prompt }, handlers)
 }
 
-async function streamAgent(goal, handlers, startUrl) {
-  return streamSse('/api/run-agent', { goal, startUrl }, handlers)
+async function streamAgent(goal, handlers, startUrl, signal) {
+  return streamSse('/api/run-agent', { goal, startUrl }, handlers, signal)
 }
 
 export default function App() {
@@ -112,6 +113,22 @@ export default function App() {
   const [planMode, setPlanMode] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
   const streamRef = useRef(null)
+  const abortRef = useRef(null)
+
+  function stopRun() {
+    if (abortRef.current) {
+      try { abortRef.current.abort() } catch {}
+      abortRef.current = null
+    }
+    setTests((prev) => prev.map((t) => (t.status === 'running' || t.status === 'planning') ? {
+      ...t,
+      status: 'fail',
+      error: 'Stopped by user',
+      summaryStreaming: false,
+      stage: t.stage ? { ...t.stage, label: 'stopped', finished: true, busy: false } : null,
+    } : t))
+    setBusy(false)
+  }
 
   const selected = useMemo(() => tests.find((t) => t.id === selectedId) || null, [tests, selectedId])
 
@@ -470,6 +487,8 @@ export default function App() {
 
     pushActivity(id, { kind: 'system', text: 'Agent is observing the page and deciding each step…' })
 
+    const ac = new AbortController()
+    abortRef.current = ac
     try {
       await streamAgent(prompt, {
         start: (p) => {
@@ -568,14 +587,19 @@ export default function App() {
             return next
           })
         },
-      })
+      }, undefined, ac.signal)
     } catch (err) {
-      update(id, {
-        status: 'fail',
-        error: String(err.message || err),
-        stage: null,
-      })
+      const msg = String(err.message || err)
+      const isAbort = err?.name === 'AbortError' || /aborted/i.test(msg)
+      if (!isAbort) {
+        update(id, {
+          status: 'fail',
+          error: msg,
+          stage: null,
+        })
+      }
     } finally {
+      if (abortRef.current === ac) abortRef.current = null
       setBusy(false)
     }
   }
@@ -680,10 +704,13 @@ export default function App() {
               </>
             )}
             {busy && (
-              <span className="btn ghost" style={{ cursor: 'default' }}>
-                <span className="dot running" style={{ display: 'inline-block', marginRight: 6 }} />
-                Working…
-              </span>
+              <>
+                <span className="btn ghost" style={{ cursor: 'default' }}>
+                  <span className="dot running" style={{ display: 'inline-block', marginRight: 6 }} />
+                  Working…
+                </span>
+                <button className="btn danger" onClick={stopRun} title="Stop the agent loop">Stop</button>
+              </>
             )}
           </div>
         </header>

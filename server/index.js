@@ -12,6 +12,10 @@ const FIREWORKS_API_KEY = process.env.FIREWORKS_API_KEY
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY
 /** Model for JSON test planning + post-run summary ("act" path). */
 const FIREWORKS_ACT_MODEL = process.env.FIREWORKS_MODEL || 'accounts/fireworks/models/kimi-k2p6'
+/** Vision-capable model used for the agentic loop so it can actually look at the screenshot.
+ *  Override with FIREWORKS_AGENT_MODEL. Default: Qwen2.5-VL-32B (strong vision + tool use). */
+const FIREWORKS_AGENT_MODEL =
+  process.env.FIREWORKS_AGENT_MODEL || 'accounts/fireworks/models/qwen2p5-vl-32b-instruct'
 /** GLM 5.1 (Z.ai) for plan mode — Fireworks serverless ID; override with FIREWORKS_PLAN_MODEL. */
 const FIREWORKS_PLAN_MODEL =
   process.env.FIREWORKS_PLAN_MODEL || 'accounts/fireworks/models/glm-5p1'
@@ -834,14 +838,14 @@ function htmlToObservation(html) {
   return s.slice(0, 6000)
 }
 
-async function streamAgentTurn({ messages, onReasoning, onContent }) {
+async function streamAgentTurn({ messages, onReasoning, onContent, signal }) {
   const body = {
-    model: FIREWORKS_ACT_MODEL,
-    max_tokens: 800,
+    model: FIREWORKS_AGENT_MODEL,
+    max_tokens: 1024,
     temperature: 0.2,
     messages,
     tools: AGENT_TOOLS,
-    tool_choice: 'required',
+    tool_choice: 'auto',
     stream: true,
   }
   const r = await fetch('https://api.fireworks.ai/inference/v1/chat/completions', {
@@ -852,6 +856,7 @@ async function streamAgentTurn({ messages, onReasoning, onContent }) {
       Accept: 'text/event-stream',
     },
     body: JSON.stringify(body),
+    signal,
   })
   if (!r.ok || !r.body) {
     const t = await r.text().catch(() => '')
@@ -903,6 +908,16 @@ async function streamAgentTurn({ messages, onReasoning, onContent }) {
   return { name: null, args: null, reasoning, content }
 }
 
+async function fetchAsDataUrl(url, signal) {
+  try {
+    const r = await fetch(url, { signal })
+    if (!r.ok) return null
+    const buf = Buffer.from(await r.arrayBuffer())
+    const ct = r.headers.get('content-type') || 'image/png'
+    return `data:${ct};base64,${buf.toString('base64')}`
+  } catch { return null }
+}
+
 app.post('/api/run-agent', async (req, res) => {
   res.set({
     'Content-Type': 'text/event-stream; charset=utf-8',
@@ -947,6 +962,9 @@ app.post('/api/run-agent', async (req, res) => {
     let replay = []
     let lastShot = null
     let lastScrape = null
+    let aborted = false
+    const ac = new AbortController()
+    req.on('close', () => { aborted = true; try { ac.abort() } catch {} })
     const messages = [
       { role: 'system', content: AGENT_SYSTEM },
       { role: 'user', content: `Goal: ${goal}\n\n${currentUrl ? `Suggested starting URL: ${currentUrl}` : 'No starting URL provided — call navigate() first with a sensible https URL.'}` },
@@ -956,15 +974,22 @@ app.post('/api/run-agent', async (req, res) => {
     let verdict = null
     const MAX_STEPS = 14
     for (let step = 0; step < MAX_STEPS; step++) {
+      if (aborted) break
       // 1. Observe current page (only if we have a URL).
       let observation
+      let screenshotDataUrl = null
       if (currentUrl) {
         send('cursor', { actionIndex: step, x: prev.x, y: prev.y, label: `observing ${currentUrl}`, busy: true })
         try {
           const acts = [...replay, { type: 'wait', milliseconds: 400 }, { type: 'screenshot' }]
           lastScrape = await fcScrape(currentUrl, acts, ['screenshot', 'html', 'markdown'])
           const shot = (lastScrape?.actions?.screenshots || [])[ (lastScrape?.actions?.screenshots || []).length - 1 ] || lastScrape?.screenshot
-          if (shot) { lastShot = shot; send('frame', { image: shot, actionIndex: step }) }
+          if (shot) {
+            lastShot = shot
+            send('frame', { image: shot, actionIndex: step })
+            // Convert to data URL so the vision model can ingest it directly.
+            screenshotDataUrl = await fetchAsDataUrl(shot, ac.signal)
+          }
           observation = {
             url: lastScrape?.metadata?.sourceURL || currentUrl,
             title: lastScrape?.metadata?.title || '',
@@ -978,12 +1003,19 @@ app.post('/api/run-agent', async (req, res) => {
       } else {
         observation = { url: '(no page yet)', title: '', text: '' }
       }
+      if (aborted) break
 
-      // 2. Build user observation message.
-      const obsMsg = observation.error
+      // 2. Build user observation message — multimodal when we have a screenshot.
+      const obsText = observation.error
         ? `Step ${step + 1}. Page load failed: ${observation.error}\nDecide the next single tool call.`
-        : `Step ${step + 1}.\nCurrent URL: ${observation.url}\nPage title: ${observation.title}\nVisible page text/HTML (truncated):\n${observation.text}\n\nCall exactly one tool for your next action.`
-      messages.push({ role: 'user', content: obsMsg })
+        : `Step ${step + 1}.\nCurrent URL: ${observation.url}\nPage title: ${observation.title}\n\nLook at the screenshot above AND the HTML below to decide your next action. The screenshot shows the visual state; the HTML is for picking accurate selectors.\n\nVisible page HTML (truncated):\n${observation.text}\n\nCall exactly one tool for your next action.`
+      const userContent = screenshotDataUrl
+        ? [
+            { type: 'image_url', image_url: { url: screenshotDataUrl } },
+            { type: 'text', text: obsText },
+          ]
+        : obsText
+      messages.push({ role: 'user', content: userContent })
 
       // 3. Stream agent turn.
       send('cursor', { actionIndex: step, x: prev.x, y: prev.y, label: 'agent thinking…', busy: true })
@@ -991,16 +1023,36 @@ app.post('/api/run-agent', async (req, res) => {
       try {
         turn = await streamAgentTurn({
           messages,
+          signal: ac.signal,
           onReasoning: (d) => send('reasoning_delta', { step, delta: d }),
           onContent:   (d) => send('content_delta',   { step, delta: d }),
         })
       } catch (err) {
+        if (aborted) break
         send('error', { error: `Agent step ${step + 1} failed: ${err.message || err}` })
         return end()
       }
+      if (aborted) break
       if (!turn.name) {
-        send('error', { error: `Agent step ${step + 1} returned no tool call` })
-        return end()
+        // Some vision models reply with prose instead of a tool call. Nudge once.
+        send('reasoning_delta', { step, delta: '\n[no tool call returned — re-prompting]\n' })
+        messages.push({ role: 'user', content: 'You must call exactly one tool. Do not write prose. Pick the single best next tool call now.' })
+        try {
+          turn = await streamAgentTurn({
+            messages,
+            signal: ac.signal,
+            onReasoning: (d) => send('reasoning_delta', { step, delta: d }),
+            onContent:   (d) => send('content_delta',   { step, delta: d }),
+          })
+        } catch (err) {
+          if (aborted) break
+          send('error', { error: `Agent step ${step + 1} retry failed: ${err.message || err}` })
+          return end()
+        }
+        if (!turn?.name) {
+          send('error', { error: `Agent step ${step + 1} returned no tool call after retry` })
+          return end()
+        }
       }
 
       // Persist the assistant turn so the model has memory.
