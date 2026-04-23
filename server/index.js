@@ -568,6 +568,8 @@ app.post('/api/run-stream', async (req, res) => {
   }
 
   let sessionId = null
+  let frameTimer = null
+  const stopFrames = () => { if (frameTimer) { clearInterval(frameTimer); frameTimer = null } }
   try {
     if (!FIRECRAWL_API_KEY) { send('error', { error: 'FIRECRAWL_API_KEY missing' }); return res.end() }
     const { plan } = req.body || {}
@@ -591,26 +593,75 @@ app.post('/api/run-stream', async (req, res) => {
       send('error', { error: `Browser create ${createR.status}: ${session?.error || createTxt.slice(0, 200)}` }); return res.end()
     }
     sessionId = session.id
-    const liveUrl = session.interactiveLiveViewUrl || session.liveViewUrl
-    send('liveview', { url: liveUrl })
 
     // ---- 2. Helper to execute Playwright code in the session ----
+    // NOTE: Firecrawl's /v2/browser/{id}/execute response `result` field is an
+    // alias for `stdout` (string), not a structured return value. So we wrap
+    // the user code in an async IIFE, capture its return value, and emit it
+    // to stdout between a sentinel so we can recover a real JS object here.
+    const FC_BEGIN = '__FC_RES_BEGIN__'
+    const FC_END = '__FC_RES_END__'
     async function exec(code) {
+      const wrapped =
+        `const __fc_val = await (async () => {\n${code}\n})();\n` +
+        `process.stdout.write(${JSON.stringify(FC_BEGIN)} + JSON.stringify(__fc_val === undefined ? null : __fc_val) + ${JSON.stringify(FC_END)});`
       const er = await fetch(`https://api.firecrawl.dev/v2/browser/${sessionId}/execute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
-        body: JSON.stringify({ code, language: 'node' }),
+        body: JSON.stringify({ code: wrapped, language: 'node' }),
       })
       const et = await er.text()
       let ed
       try { ed = JSON.parse(et) } catch { throw new Error(`exec non-JSON (${er.status}): ${et.slice(0, 200)}`) }
-      if (!er.ok || ed.success === false) throw new Error(`exec ${er.status}: ${ed?.error || et.slice(0, 200)}`)
-      return ed.result ?? ed.data ?? ed
+      if (!er.ok || ed.success === false) {
+        throw new Error(`exec ${er.status}: ${ed?.error || ed?.stderr || et.slice(0, 200)}`)
+      }
+      const out = String(ed.stdout ?? ed.result ?? '')
+      const s = out.lastIndexOf(FC_BEGIN)
+      const e = out.lastIndexOf(FC_END)
+      if (s === -1 || e === -1 || e <= s) return null
+      try { return JSON.parse(out.slice(s + FC_BEGIN.length, e)) } catch { return null }
     }
+
+    // ---- 2b. Live frame streaming via periodic Playwright screenshots.
+    // We capture JPEGs in the sandbox, base64-encode them there, and send them
+    // back as SSE `frame` events. No external live-view URL / iframe is used. ----
+    let frameActionIndex = -1
+    let framesInFlight = false
+    let actionInFlight = false
+    async function captureFrame() {
+      // Skip if a screenshot is already running, or if an action exec is in
+      // flight — the Firecrawl sandbox serializes execs per session, so we
+      // don't want a JPEG encode to stall the user's click/type.
+      if (framesInFlight || actionInFlight) return
+      framesInFlight = true
+      try {
+        const r = await exec(
+          `try {
+             const buf = await page.screenshot({ type: 'jpeg', quality: 55, fullPage: false, timeout: 4000 });
+             return { image: 'data:image/jpeg;base64,' + buf.toString('base64') };
+           } catch (e) { return { error: String(e.message || e) }; }`
+        )
+        if (r && r.image) {
+          send('frame', { image: r.image, actionIndex: frameActionIndex })
+        }
+      } catch { /* ignore transient screenshot errors */ } finally {
+        framesInFlight = false
+      }
+    }
+    async function withAction(fn) {
+      actionInFlight = true
+      try { return await fn() } finally { actionInFlight = false }
+    }
+    frameTimer = setInterval(() => { captureFrame().catch(() => {}) }, 700)
 
     // ---- 3. Navigate to start URL ----
     send('cursor', { actionIndex: -1, x: 0.5, y: 0.1, label: `navigating to ${plan.url}` })
-    await exec(`await page.goto(${JSON.stringify(plan.url)}, { waitUntil: 'domcontentloaded', timeout: 45000 }); return { url: page.url() };`)
+    await withAction(() =>
+      exec(`await page.goto(${JSON.stringify(plan.url)}, { waitUntil: 'domcontentloaded', timeout: 45000 }); return { url: page.url() };`)
+    )
+    // First frame immediately so the UI has something to show.
+    await captureFrame()
 
     // ---- 4. Run actions one at a time, streaming a cursor event per step ----
     let prev = { x: 0.5, y: 0.5 }
@@ -647,36 +698,44 @@ app.post('/api/run-stream', async (req, res) => {
           } catch { /* keep estimate */ }
         }
         prev = cursor
+        frameActionIndex = i
         send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label })
         await sleep(180)
 
         try {
-          if (sa.type === 'click') {
-            await exec(`await page.locator(${JSON.stringify(sa.selector)}).first().click({ timeout: 10000 }); return {};`)
-          } else if (sa.type === 'write') {
-            await exec(`await page.keyboard.type(${JSON.stringify(sa.text || '')}, { delay: 25 }); return {};`)
-          } else if (sa.type === 'press') {
-            await exec(`await page.keyboard.press(${JSON.stringify(sa.key || 'Enter')}); return {};`)
-          } else if (sa.type === 'wait') {
-            if (sa.selector) {
-              await exec(`await page.waitForSelector(${JSON.stringify(sa.selector)}, { timeout: 15000 }); return {};`)
-            } else {
-              await exec(`await page.waitForTimeout(${Math.max(50, Number(sa.milliseconds) || 500)}); return {};`)
+          await withAction(async () => {
+            if (sa.type === 'click') {
+              await exec(`await page.locator(${JSON.stringify(sa.selector)}).first().click({ timeout: 10000 }); return {};`)
+            } else if (sa.type === 'write') {
+              await exec(`await page.keyboard.type(${JSON.stringify(sa.text || '')}, { delay: 25 }); return {};`)
+            } else if (sa.type === 'press') {
+              await exec(`await page.keyboard.press(${JSON.stringify(sa.key || 'Enter')}); return {};`)
+            } else if (sa.type === 'wait') {
+              if (sa.selector) {
+                await exec(`await page.waitForSelector(${JSON.stringify(sa.selector)}, { timeout: 15000 }); return {};`)
+              } else {
+                await exec(`await page.waitForTimeout(${Math.max(50, Number(sa.milliseconds) || 500)}); return {};`)
+              }
+            } else if (sa.type === 'scroll') {
+              const dy = sa.direction === 'up' ? -600 : 600
+              await exec(`await page.evaluate(() => window.scrollBy(0, ${dy})); return {};`)
+            } else if (sa.type === 'screenshot' || sa.type === 'scrape') {
+              // No-op: frames are streamed continuously via captureFrame().
             }
-          } else if (sa.type === 'scroll') {
-            const dy = sa.direction === 'up' ? -600 : 600
-            await exec(`await page.evaluate(() => window.scrollBy(0, ${dy})); return {};`)
-          } else if (sa.type === 'screenshot' || sa.type === 'scrape') {
-            // No-op: live view shows everything in real time.
-          }
+          })
         } catch (err) {
           send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `! ${label} failed` })
         }
+        // Force a fresh frame right after each action for snappier feedback.
+        await captureFrame()
       }
     }
 
     // ---- 5. Capture final state for assertions ----
+    frameActionIndex = -1
     send('cursor', { actionIndex: -1, x: 0.5, y: 0.5, label: 'evaluating assertions' })
+    stopFrames()
+    await captureFrame()
     let finalState = { url: plan.url, title: '', html: '', text: '' }
     try {
       finalState = await exec(
@@ -710,6 +769,7 @@ app.post('/api/run-stream', async (req, res) => {
     try { send('error', { error: String(err.message || err) }) } catch {}
     res.end()
   } finally {
+    stopFrames()
     if (sessionId) {
       fetch(`https://api.firecrawl.dev/v2/browser/${sessionId}`, {
         method: 'DELETE',

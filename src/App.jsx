@@ -95,20 +95,14 @@ export default function App() {
       expect: plan.expect,
       stepDescriptions: plan.actions.map(describeAction),
       log: '',
-      stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'preparing browser…', actionIndex: -1 },
+      stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'preparing browser…', actionIndex: -1, finished: false },
       summary: null,
     })
 
     try {
       await streamRun(plan, {
         start: () => {
-          update(id, { stage: { image: null, liveUrl: null, cursor: { x: 0.5, y: 0.5 }, label: 'spinning up browser…', actionIndex: -1 } })
-        },
-        liveview: (p) => {
-          setTests((prev) => prev.map((t) => t.id === id ? {
-            ...t,
-            stage: { ...(t.stage || {}), liveUrl: p.url, label: 'live browser ready' }
-          } : t))
+          update(id, { stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'spinning up browser…', actionIndex: -1, finished: false } })
         },
         cursor: (p) => {
           setTests((prev) => prev.map((t) => t.id === id ? {
@@ -613,14 +607,7 @@ function LiveStage({ stage, status }) {
         </span>
       </div>
       <div className="stage-frame">
-        {stage?.liveUrl ? (
-          <iframe
-            className="stage-iframe"
-            src={stage.liveUrl}
-            title="live browser"
-            allow="fullscreen; clipboard-read; clipboard-write"
-          />
-        ) : stage?.image ? (
+        {stage?.image ? (
           <img className="stage-img" src={stage.image} alt="live" />
         ) : (
           <div className="stage-blank">
