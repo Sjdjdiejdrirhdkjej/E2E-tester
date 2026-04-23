@@ -58,11 +58,11 @@ function describeAction(a) {
   }
 }
 
-async function streamRun(plan, handlers) {
-  const r = await fetch('/api/run-stream', {
+async function streamSse(url, body, handlers) {
+  const r = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ plan }),
+    body: JSON.stringify(body),
   })
   if (!r.ok || !r.body) {
     const t = await r.text().catch(() => '')
@@ -90,6 +90,14 @@ async function streamRun(plan, handlers) {
       handlers[event]?.(payload)
     }
   }
+}
+
+async function streamRun(plan, handlers) {
+  return streamSse('/api/run-stream', { plan }, handlers)
+}
+
+async function streamPlan(prompt, handlers) {
+  return streamSse('/api/plan-stream', { prompt }, handlers)
 }
 
 export default function App() {
@@ -151,6 +159,33 @@ export default function App() {
     })
   }
 
+  function pushActivity(id, entry) {
+    setTests((prev) => prev.map((t) => t.id === id ? {
+      ...t,
+      liveActivity: [...(t.liveActivity || []), { ...entry, at: Date.now() }],
+    } : t))
+  }
+
+  function appendReasoning(id, kind, delta) {
+    setTests((prev) => prev.map((t) => {
+      if (t.id !== id) return t
+      const list = t.liveActivity || []
+      const last = list[list.length - 1]
+      if (last && last.kind === kind && last.streaming) {
+        const updated = { ...last, text: (last.text || '') + delta }
+        return { ...t, liveActivity: [...list.slice(0, -1), updated] }
+      }
+      return { ...t, liveActivity: [...list, { kind, text: delta, streaming: true, at: Date.now() }] }
+    }))
+  }
+
+  function finalizeReasoning(id) {
+    setTests((prev) => prev.map((t) => {
+      if (t.id !== id) return t
+      return { ...t, liveActivity: (t.liveActivity || []).map((e) => e.streaming ? { ...e, streaming: false } : e) }
+    }))
+  }
+
   async function executePlannedRun(id, plan, displayNameFallback) {
     update(id, {
       status: 'running',
@@ -163,6 +198,7 @@ export default function App() {
       stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'preparing browser…', actionIndex: -1, finished: false },
       summary: null,
     })
+    pushActivity(id, { kind: 'system', text: `Run starting · ${plan.actions.length} actions` })
 
     try {
       await streamRun(plan, {
@@ -174,6 +210,9 @@ export default function App() {
             ...t,
             stage: { ...(t.stage || {}), cursor: { x: p.x, y: p.y }, label: p.label, actionIndex: p.actionIndex }
           } : t))
+        },
+        thinking: (p) => {
+          pushActivity(id, { kind: 'tool_call', tool: p.tool, args: p.args, label: p.label, rationale: p.rationale, actionIndex: p.actionIndex })
         },
         frame: (p) => {
           setTests((prev) => prev.map((t) => t.id === id ? {
@@ -423,16 +462,16 @@ export default function App() {
     setBusy(true)
     persistTask(draftTest)
 
+    pushActivity(id, { kind: 'system', text: 'Act planner is generating the test plan…' })
     let plan
     try {
-      const r = await fetch('/api/plan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt }),
+      await streamPlan(prompt, {
+        reasoning_delta: (p) => appendReasoning(id, 'reasoning', p.delta || ''),
+        content_delta: (p) => appendReasoning(id, 'plan_json', p.delta || ''),
+        plan: (p) => { plan = p.plan; finalizeReasoning(id) },
+        error: (p) => { throw new Error(p.error || 'plan failed') },
       })
-      const data = await readJson(r)
-      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`)
-      plan = data.plan
+      if (!plan) throw new Error('Planner returned no plan')
     } catch (err) {
       update(id, {
         status: 'fail',
@@ -618,6 +657,10 @@ export default function App() {
                 />
               )}
 
+              {selected.liveActivity?.length > 0 && (
+                <LiveActivity entries={selected.liveActivity} />
+              )}
+
               {selected.actPrompt && selected.status !== 'clarifying' && (
                 <div className="bubble">
                   <div className="who">Act brief (from plan mode)</div>
@@ -725,6 +768,71 @@ export default function App() {
           </div>
         )}
       </section>
+    </div>
+  )
+}
+
+function LiveActivity({ entries }) {
+  const ref = useRef(null)
+  useEffect(() => {
+    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight
+  }, [entries.length, entries[entries.length - 1]?.text?.length])
+  return (
+    <div className="activity-panel">
+      <div className="activity-head">
+        <span className="activity-pulse" />
+        Live activity · reasoning &amp; tool calls
+      </div>
+      <div className="activity-body" ref={ref}>
+        {entries.map((e, i) => {
+          if (e.kind === 'tool_call') {
+            return (
+              <div className="activity-item tool" key={i}>
+                <div className="activity-row">
+                  <span className="activity-tag">tool</span>
+                  <span className="activity-tool">{e.tool}</span>
+                  {typeof e.actionIndex === 'number' && e.actionIndex >= 0 && (
+                    <span className="activity-step">step {e.actionIndex + 1}</span>
+                  )}
+                </div>
+                <div className="activity-label">{e.label}</div>
+                <pre className="activity-args">{JSON.stringify(e.args, null, 2)}</pre>
+              </div>
+            )
+          }
+          if (e.kind === 'reasoning') {
+            return (
+              <div className="activity-item reasoning" key={i}>
+                <div className="activity-row">
+                  <span className="activity-tag reason">reasoning</span>
+                </div>
+                <div className="activity-text">
+                  {e.text}
+                  {e.streaming && <span className="type-caret" />}
+                </div>
+              </div>
+            )
+          }
+          if (e.kind === 'plan_json') {
+            return (
+              <div className="activity-item plan" key={i}>
+                <div className="activity-row">
+                  <span className="activity-tag plan">plan json</span>
+                </div>
+                <pre className="activity-args">{e.text}{e.streaming && <span className="type-caret" />}</pre>
+              </div>
+            )
+          }
+          return (
+            <div className="activity-item sys" key={i}>
+              <div className="activity-row">
+                <span className="activity-tag sys">·</span>
+                <span className="activity-text">{e.text}</span>
+              </div>
+            </div>
+          )
+        })}
+      </div>
     </div>
   )
 }

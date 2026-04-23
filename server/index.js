@@ -320,6 +320,96 @@ app.post('/api/plan-intake', async (req, res) => {
   }
 })
 
+app.post('/api/plan-stream', async (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Content-Encoding': 'identity',
+  })
+  try { req.socket?.setNoDelay?.(true) } catch {}
+  res.flushHeaders?.()
+  res.write(`: ${' '.repeat(2048)}\n\n`)
+  const send = (event, data) => {
+    res.write(`event: ${event}\n`)
+    res.write(`data: ${JSON.stringify(data)}\n\n`)
+  }
+  const heartbeat = setInterval(() => { try { res.write(`: hb ${Date.now()}\n\n`) } catch {} }, 10000)
+  const end = () => { clearInterval(heartbeat); try { res.end() } catch {} }
+  try {
+    if (!FIREWORKS_API_KEY) { send('error', { error: 'FIREWORKS_API_KEY missing' }); return end() }
+    const { prompt } = req.body || {}
+    if (!prompt || typeof prompt !== 'string') { send('error', { error: 'prompt required' }); return end() }
+    send('start', { stage: 'plan' })
+
+    // Stream reasoning + content from Fireworks act planner.
+    const body = {
+      model: FIREWORKS_ACT_MODEL,
+      max_tokens: 2048,
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: PLAN_SYSTEM },
+        { role: 'user', content: prompt },
+      ],
+      response_format: { type: 'json_object' },
+      stream: true,
+    }
+    const r = await fetch('https://api.fireworks.ai/inference/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${FIREWORKS_API_KEY}`,
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify(body),
+    })
+    if (!r.ok || !r.body) {
+      const t = await r.text().catch(() => '')
+      send('error', { error: `Fireworks ${r.status}: ${t.slice(0, 200)}` })
+      return end()
+    }
+    const reader = r.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    let full = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      let idx
+      while ((idx = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, idx).trim()
+        buf = buf.slice(idx + 1)
+        if (!line || !line.startsWith('data:')) continue
+        const data = line.slice(5).trim()
+        if (data === '[DONE]') break
+        try {
+          const j = JSON.parse(data)
+          const d = j.choices?.[0]?.delta || {}
+          if (d.reasoning_content) send('reasoning_delta', { delta: d.reasoning_content })
+          if (d.content) {
+            full += d.content
+            send('content_delta', { delta: d.content })
+          }
+        } catch {}
+      }
+    }
+    let plan
+    try { plan = parsePlan(full) } catch (err) {
+      send('error', { error: `Plan parse failed: ${err.message || err}` })
+      return end()
+    }
+    send('plan', { plan })
+    send('done', {})
+    end()
+  } catch (err) {
+    console.error('plan-stream error:', err)
+    try { send('error', { error: String(err.message || err) }) } catch {}
+    end()
+  }
+})
+
 app.post('/api/plan', async (req, res) => {
   try {
     if (!FIREWORKS_API_KEY) return res.status(400).json({ error: 'FIREWORKS_API_KEY missing' })
@@ -818,6 +908,13 @@ ${trimmedHtml}`
 
         const cursor = estimateCursor(a, prev)
         prev = cursor
+        send('thinking', {
+          actionIndex: i,
+          tool: sa.type,
+          args: sa,
+          label,
+          rationale: `Step ${i + 1} of ${plan.actions.length}: ${label}`,
+        })
         send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label })
 
         replay.push(sa)
