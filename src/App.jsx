@@ -100,6 +100,10 @@ async function streamPlan(prompt, handlers) {
   return streamSse('/api/plan-stream', { prompt }, handlers)
 }
 
+async function streamAgent(goal, handlers, startUrl) {
+  return streamSse('/api/run-agent', { goal, startUrl }, handlers)
+}
+
 export default function App() {
   const [tests, setTests] = useState([])
   const [selectedId, setSelectedId] = useState(null)
@@ -444,7 +448,7 @@ export default function App() {
       strategistMessage: null,
       assistantSnapshot: null,
       clarifyingAnswers: '',
-      status: 'planning',
+      status: 'running',
       url: null,
       actions: [],
       expect: [],
@@ -455,34 +459,125 @@ export default function App() {
       title: '',
       duration: null,
       error: null,
-      log: 'Asking the act planner to build the scenario…\n',
+      log: 'Agent loop starting — observing each page and deciding the next step live…\n',
+      stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'spinning up browser…', actionIndex: -1, finished: false },
+      summary: null,
     }
     setTests((prev) => [draftTest, ...prev])
     setSelectedId(id)
     setBusy(true)
     persistTask(draftTest)
 
-    pushActivity(id, { kind: 'system', text: 'Act planner is generating the test plan…' })
-    let plan
+    pushActivity(id, { kind: 'system', text: 'Agent is observing the page and deciding each step…' })
+
     try {
-      await streamPlan(prompt, {
+      await streamAgent(prompt, {
+        start: (p) => {
+          update(id, { url: p.startUrl || null, stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'agent thinking…', actionIndex: -1, finished: false } })
+        },
+        observation: (p) => {
+          if (!p.url) return
+          if (p.error) {
+            pushActivity(id, { kind: 'system', text: `Step ${p.step + 1}: page load failed — ${p.error}` })
+          } else {
+            pushActivity(id, { kind: 'system', text: `Step ${p.step + 1}: observing ${p.title ? `"${p.title}" — ` : ''}${p.url}` })
+          }
+        },
         reasoning_delta: (p) => appendReasoning(id, 'reasoning', p.delta || ''),
         content_delta: (p) => appendReasoning(id, 'plan_json', p.delta || ''),
-        plan: (p) => { plan = p.plan; finalizeReasoning(id) },
-        error: (p) => { throw new Error(p.error || 'plan failed') },
+        cursor: (p) => {
+          setTests((prev) => prev.map((t) => t.id === id ? {
+            ...t,
+            stage: { ...(t.stage || {}), cursor: { x: p.x, y: p.y }, label: p.label, actionIndex: p.actionIndex, busy: Boolean(p.busy) }
+          } : t))
+        },
+        thinking: (p) => {
+          finalizeReasoning(id)
+          pushActivity(id, { kind: 'tool_call', tool: p.tool, args: p.args, label: p.label, rationale: p.rationale, actionIndex: p.actionIndex })
+          setTests((prev) => prev.map((t) => t.id === id ? {
+            ...t,
+            actions: [...(t.actions || []), { tool: p.tool, args: p.args }],
+            stepDescriptions: [...(t.stepDescriptions || []), p.label],
+          } : t))
+        },
+        frame: (p) => {
+          setTests((prev) => prev.map((t) => t.id === id ? {
+            ...t,
+            stage: { ...(t.stage || {}), image: p.image, actionIndex: p.actionIndex }
+          } : t))
+        },
+        summary_start: (p) => {
+          setTests((prev) => {
+            const next = prev.map((t) => t.id === id ? {
+              ...t,
+              status: p.passed ? 'pass' : 'fail',
+              duration: p.durationMs,
+              expectations: p.expectations || [],
+              finalUrl: p.finalUrl,
+              title: p.title,
+              summary: '',
+              summaryStreaming: true,
+              stage: t.stage ? { ...t.stage, label: p.passed ? 'done' : 'failed', finished: true } : null,
+            } : t)
+            const u = next.find((t) => t.id === id)
+            if (u) persistTask(u)
+            return next
+          })
+        },
+        summary_delta: (p) => {
+          setTests((prev) => prev.map((t) => t.id === id
+            ? { ...t, summary: (t.summary || '') + (p.delta || '') }
+            : t))
+        },
+        done: (p) => {
+          setTests((prev) => {
+            const next = prev.map((t) => t.id === id ? {
+              ...t,
+              status: p.passed ? 'pass' : 'fail',
+              duration: p.durationMs,
+              screenshots: p.screenshots || [],
+              expectations: p.expectations || [],
+              finalUrl: p.finalUrl,
+              title: p.title,
+              summary: p.summary || t.summary,
+              summaryStreaming: false,
+              stage: {
+                image: (p.screenshots && p.screenshots[p.screenshots.length - 1]) || t.stage?.image || null,
+                cursor: t.stage?.cursor || { x: 0.5, y: 0.5 },
+                label: p.passed ? 'done' : 'failed',
+                actionIndex: -1,
+                finished: true,
+              },
+            } : t)
+            const u = next.find((t) => t.id === id)
+            if (u) persistTask(u)
+            return next
+          })
+        },
+        error: (p) => {
+          setTests((prev) => {
+            const next = prev.map((t) => t.id === id ? {
+              ...t,
+              status: 'fail',
+              error: p.error,
+              summary: null,
+              stage: t.stage ? { ...t.stage, label: 'error', finished: true } : null,
+            } : t)
+            const u = next.find((t) => t.id === id)
+            if (u) persistTask(u)
+            return next
+          })
+        },
       })
-      if (!plan) throw new Error('Planner returned no plan')
     } catch (err) {
       update(id, {
         status: 'fail',
         error: String(err.message || err),
-        log: draftTest.log + `\nPlanner failed: ${err.message || err}\n`,
+        stage: null,
       })
+    } finally {
       setBusy(false)
-      return
     }
-
-    await executePlannedRun(id, plan, draftTest.name)
   }
 
   async function submitDraft() {

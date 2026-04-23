@@ -761,6 +761,301 @@ async function summarizeRun({ plan, finalUrl, title, expectations, passed, durat
   }
 }
 
+// ----- Agentic loop: model observes the page after every action and decides
+// the next single tool call. Streams reasoning + tool calls + frames live. -----
+
+const AGENT_SYSTEM = `You are an autonomous browser-testing agent. Each turn you receive the user's overall goal and a fresh observation of the current page (URL, title, a snippet of the rendered text/HTML, and recent action history). You also implicitly see the page screenshot the user is viewing.
+
+You MUST respond by calling exactly ONE tool per turn. Do not write any prose; the tool call IS your action. Do not pre-plan multiple actions — just pick the single best next step based on what the page currently shows.
+
+Tools available:
+- navigate({ url }): go to a fully-qualified https URL (use this for the very first step if no page is loaded).
+- click({ selector }): click an element. Strongly prefer Playwright text selectors like "text=Sign in", "text=/^Search/i", or attribute selectors like "input[name='q']", "[aria-label='Search']", "[placeholder*='Search']". NEVER invent class names you cannot see in the HTML.
+- type_text({ text }): type text into the field that was most recently clicked/focused. There is NO selector — click the input first, then type.
+- press({ key }): press a key (usually "Enter" to submit a form).
+- scroll({ direction }): "up" or "down".
+- wait({ milliseconds }): wait briefly for the page to settle (200-2000 ms).
+- finish({ passed, reason, evidence }): end the test. Set passed=true if the goal was met, false otherwise. reason is a short human explanation; evidence is a quoted snippet from the observed page text that supports the verdict.
+
+Rules:
+- Always call exactly one tool per turn — never zero, never multiple.
+- After typing, follow with press("Enter") or click the submit button.
+- If a previous click failed (the observation shows the page didn't change), try a different selector based on what's actually in the HTML.
+- Do not reuse credentials; placeholders only.
+- Stop with finish() as soon as you have evidence the goal succeeded or definitively failed.`
+
+const AGENT_TOOLS = [
+  { type: 'function', function: { name: 'navigate', description: 'Open a URL', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
+  { type: 'function', function: { name: 'click', description: 'Click an element by selector', parameters: { type: 'object', properties: { selector: { type: 'string' } }, required: ['selector'] } } },
+  { type: 'function', function: { name: 'type_text', description: 'Type into the focused field', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } } },
+  { type: 'function', function: { name: 'press', description: 'Press a key', parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } } },
+  { type: 'function', function: { name: 'scroll', description: 'Scroll the page', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] } }, required: ['direction'] } } },
+  { type: 'function', function: { name: 'wait', description: 'Wait briefly', parameters: { type: 'object', properties: { milliseconds: { type: 'number' } }, required: ['milliseconds'] } } },
+  { type: 'function', function: { name: 'finish', description: 'End the test', parameters: { type: 'object', properties: { passed: { type: 'boolean' }, reason: { type: 'string' }, evidence: { type: 'string' } }, required: ['passed', 'reason'] } } },
+]
+
+function agentToolToFirecrawl(name, args) {
+  switch (name) {
+    case 'click':     return { type: 'click', selector: String(args.selector || '') }
+    case 'type_text': return { type: 'write', text: String(args.text ?? '') }
+    case 'press':     return { type: 'press', key: String(args.key || 'Enter') }
+    case 'scroll':    return { type: 'scroll', direction: args.direction === 'up' ? 'up' : 'down' }
+    case 'wait':      return { type: 'wait', milliseconds: Math.max(50, Math.min(5000, Number(args.milliseconds) || 500)) }
+    default:          return null
+  }
+}
+
+function shortLabel(name, args) {
+  switch (name) {
+    case 'navigate':  return `navigate to ${args.url}`
+    case 'click':     return `click ${args.selector}`
+    case 'type_text': return `type "${String(args.text || '').slice(0, 60)}"`
+    case 'press':     return `press ${args.key}`
+    case 'scroll':    return `scroll ${args.direction}`
+    case 'wait':      return `wait ${args.milliseconds}ms`
+    case 'finish':    return `finish (${args.passed ? 'pass' : 'fail'})`
+    default:          return name
+  }
+}
+
+function htmlToObservation(html) {
+  if (!html) return ''
+  let s = String(html)
+  s = s.replace(/<script[\s\S]*?<\/script>/gi, ' ')
+       .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+       .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+       .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
+       .replace(/\son\w+="[^"]*"/gi, '')
+       .replace(/\sstyle="[^"]*"/gi, '')
+       .replace(/\sclass="[^"]*"/gi, '')
+       .replace(/\sdata-[a-z0-9-]+="[^"]*"/gi, '')
+       .replace(/\s+/g, ' ')
+       .trim()
+  return s.slice(0, 6000)
+}
+
+async function streamAgentTurn({ messages, onReasoning, onContent }) {
+  const body = {
+    model: FIREWORKS_ACT_MODEL,
+    max_tokens: 800,
+    temperature: 0.2,
+    messages,
+    tools: AGENT_TOOLS,
+    tool_choice: 'required',
+    stream: true,
+  }
+  const r = await fetch('https://api.fireworks.ai/inference/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${FIREWORKS_API_KEY}`,
+      Accept: 'text/event-stream',
+    },
+    body: JSON.stringify(body),
+  })
+  if (!r.ok || !r.body) {
+    const t = await r.text().catch(() => '')
+    throw new Error(`Fireworks ${r.status}: ${t.slice(0, 300)}`)
+  }
+  const reader = r.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  let content = ''
+  let reasoning = ''
+  // tool_calls assembled by index
+  const toolBuf = {}
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let idx
+    while ((idx = buf.indexOf('\n')) !== -1) {
+      const line = buf.slice(0, idx).trim()
+      buf = buf.slice(idx + 1)
+      if (!line || !line.startsWith('data:')) continue
+      const data = line.slice(5).trim()
+      if (data === '[DONE]') break
+      try {
+        const j = JSON.parse(data)
+        const d = j.choices?.[0]?.delta || {}
+        if (d.reasoning_content) { reasoning += d.reasoning_content; onReasoning?.(d.reasoning_content) }
+        if (d.content) { content += d.content; onContent?.(d.content) }
+        if (Array.isArray(d.tool_calls)) {
+          for (const tc of d.tool_calls) {
+            const i = tc.index ?? 0
+            const slot = toolBuf[i] || (toolBuf[i] = { name: '', args: '' })
+            if (tc.function?.name) slot.name = tc.function.name
+            if (tc.function?.arguments) slot.args += tc.function.arguments
+          }
+        }
+      } catch {}
+    }
+  }
+  // Pick the first complete tool call.
+  const indices = Object.keys(toolBuf).map(Number).sort((a, b) => a - b)
+  for (const i of indices) {
+    const slot = toolBuf[i]
+    if (!slot?.name) continue
+    let args = {}
+    try { args = JSON.parse(slot.args || '{}') } catch {}
+    return { name: slot.name, args, reasoning, content }
+  }
+  return { name: null, args: null, reasoning, content }
+}
+
+app.post('/api/run-agent', async (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Content-Encoding': 'identity',
+  })
+  try { req.socket?.setNoDelay?.(true) } catch {}
+  res.flushHeaders?.()
+  res.write(`: ${' '.repeat(2048)}\n\n`)
+  const send = (event, data) => {
+    res.write(`event: ${event}\n`)
+    res.write(`data: ${JSON.stringify(data)}\n\n`)
+  }
+  const heartbeat = setInterval(() => { try { res.write(`: hb ${Date.now()}\n\n`) } catch {} }, 10000)
+  const end = () => { clearInterval(heartbeat); try { res.end() } catch {} }
+
+  try {
+    if (!FIREWORKS_API_KEY) { send('error', { error: 'FIREWORKS_API_KEY missing' }); return end() }
+    if (!FIRECRAWL_API_KEY) { send('error', { error: 'FIRECRAWL_API_KEY missing' }); return end() }
+    const { goal, startUrl } = req.body || {}
+    if (!goal || typeof goal !== 'string') { send('error', { error: 'goal required' }); return end() }
+
+    const startMs = Date.now()
+    send('start', { goal, startUrl: startUrl || null })
+
+    async function fcScrape(url, actions, formats = ['screenshot']) {
+      const r = await fetch('https://api.firecrawl.dev/v1/scrape', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
+        body: JSON.stringify({ url, formats, onlyMainContent: false, waitFor: 600, timeout: 60000, actions }),
+      })
+      const text = await r.text()
+      let data
+      try { data = JSON.parse(text) } catch { throw new Error(`Firecrawl non-JSON ${r.status}: ${text.slice(0, 200)}`) }
+      if (!r.ok || data.success === false) throw new Error(`Firecrawl ${r.status}: ${data?.error || text.slice(0, 200)}`)
+      return data.data || data
+    }
+
+    let currentUrl = startUrl || null
+    let replay = []
+    let lastShot = null
+    let lastScrape = null
+    const messages = [
+      { role: 'system', content: AGENT_SYSTEM },
+      { role: 'user', content: `Goal: ${goal}\n\n${currentUrl ? `Suggested starting URL: ${currentUrl}` : 'No starting URL provided — call navigate() first with a sensible https URL.'}` },
+    ]
+
+    let prev = { x: 0.5, y: 0.5 }
+    let verdict = null
+    const MAX_STEPS = 14
+    for (let step = 0; step < MAX_STEPS; step++) {
+      // 1. Observe current page (only if we have a URL).
+      let observation
+      if (currentUrl) {
+        send('cursor', { actionIndex: step, x: prev.x, y: prev.y, label: `observing ${currentUrl}`, busy: true })
+        try {
+          const acts = [...replay, { type: 'wait', milliseconds: 400 }, { type: 'screenshot' }]
+          lastScrape = await fcScrape(currentUrl, acts, ['screenshot', 'html', 'markdown'])
+          const shot = (lastScrape?.actions?.screenshots || [])[ (lastScrape?.actions?.screenshots || []).length - 1 ] || lastScrape?.screenshot
+          if (shot) { lastShot = shot; send('frame', { image: shot, actionIndex: step }) }
+          observation = {
+            url: lastScrape?.metadata?.sourceURL || currentUrl,
+            title: lastScrape?.metadata?.title || '',
+            text: htmlToObservation(lastScrape?.html || lastScrape?.markdown || ''),
+          }
+          send('observation', { step, url: observation.url, title: observation.title })
+        } catch (err) {
+          observation = { url: currentUrl, title: '', text: '', error: String(err.message || err) }
+          send('observation', { step, url: currentUrl, title: '', error: observation.error })
+        }
+      } else {
+        observation = { url: '(no page yet)', title: '', text: '' }
+      }
+
+      // 2. Build user observation message.
+      const obsMsg = observation.error
+        ? `Step ${step + 1}. Page load failed: ${observation.error}\nDecide the next single tool call.`
+        : `Step ${step + 1}.\nCurrent URL: ${observation.url}\nPage title: ${observation.title}\nVisible page text/HTML (truncated):\n${observation.text}\n\nCall exactly one tool for your next action.`
+      messages.push({ role: 'user', content: obsMsg })
+
+      // 3. Stream agent turn.
+      send('cursor', { actionIndex: step, x: prev.x, y: prev.y, label: 'agent thinking…', busy: true })
+      let turn
+      try {
+        turn = await streamAgentTurn({
+          messages,
+          onReasoning: (d) => send('reasoning_delta', { step, delta: d }),
+          onContent:   (d) => send('content_delta',   { step, delta: d }),
+        })
+      } catch (err) {
+        send('error', { error: `Agent step ${step + 1} failed: ${err.message || err}` })
+        return end()
+      }
+      if (!turn.name) {
+        send('error', { error: `Agent step ${step + 1} returned no tool call` })
+        return end()
+      }
+
+      // Persist the assistant turn so the model has memory.
+      messages.push({
+        role: 'assistant',
+        content: turn.content || '',
+        tool_calls: [{ id: `c${step}`, type: 'function', function: { name: turn.name, arguments: JSON.stringify(turn.args || {}) } }],
+      })
+
+      const label = shortLabel(turn.name, turn.args || {})
+      const cursor = estimateCursor(turn.name === 'click' ? { type: 'click', selector: turn.args?.selector } : { type: turn.name }, prev)
+      prev = cursor
+      send('thinking', { actionIndex: step, tool: turn.name, args: turn.args, label, rationale: turn.reasoning?.slice(0, 400) || '' })
+      send('cursor', { actionIndex: step, x: cursor.x, y: cursor.y, label, busy: false })
+
+      // 4. Execute tool.
+      if (turn.name === 'finish') {
+        verdict = { passed: Boolean(turn.args?.passed), reason: String(turn.args?.reason || ''), evidence: String(turn.args?.evidence || '') }
+        // Tool result back to model (closes the tool call).
+        messages.push({ role: 'tool', tool_call_id: `c${step}`, content: 'OK' })
+        break
+      }
+      if (turn.name === 'navigate') {
+        const newUrl = String(turn.args?.url || '').trim()
+        if (newUrl) { currentUrl = newUrl; replay = [] }
+        messages.push({ role: 'tool', tool_call_id: `c${step}`, content: `navigated to ${newUrl}` })
+        continue
+      }
+      const fcAct = agentToolToFirecrawl(turn.name, turn.args || {})
+      if (fcAct) replay.push(fcAct)
+      messages.push({ role: 'tool', tool_call_id: `c${step}`, content: 'OK' })
+    }
+
+    const durationMs = Date.now() - startMs
+    const finalUrl = lastScrape?.metadata?.sourceURL || currentUrl || ''
+    const title = lastScrape?.metadata?.title || ''
+    const passed = verdict ? verdict.passed : false
+    const expectations = verdict
+      ? [{ kind: 'agent_verdict', value: verdict.reason || (passed ? 'passed' : 'failed'), pass: passed }]
+      : [{ kind: 'agent_verdict', value: 'agent ran out of steps without calling finish()', pass: false }]
+
+    send('summary_start', { passed, expectations, finalUrl, title, durationMs })
+    const summary = await streamSummaryRun(
+      { plan: { name: goal, url: startUrl || finalUrl }, finalUrl, title, expectations, passed, durationMs },
+      (delta) => send('summary_delta', { delta })
+    )
+    send('done', { summary, expectations, passed, finalUrl, title, durationMs, screenshots: lastShot ? [lastShot] : [], verdict })
+    end()
+  } catch (err) {
+    console.error('run-agent error:', err)
+    try { send('error', { error: String(err.message || err) }) } catch {}
+    end()
+  }
+})
+
 app.post('/api/run-stream', async (req, res) => {
   // --- Streaming hardening ---
   // The combination of Replit's https proxy + Vite's dev http-proxy + Node's
