@@ -612,6 +612,40 @@ app.post('/api/run-stream', async (req, res) => {
       return data.data || data
     }
 
+    // ---- Self-healing: when a click/wait selector fails, ask the AI to look
+    // at the current page HTML and propose a corrected Playwright-compatible
+    // selector for the same intent. Returns the new selector string, or null. ----
+    async function repairSelector({ failedAction, intentLabel, html }) {
+      try {
+        const trimmedHtml = String(html || '').slice(0, 18000)
+        const sys = `You repair broken Playwright selectors for an E2E test runner that uses Firecrawl's actions API.
+You will be given:
+1. The failing action (click or wait) the test agent tried.
+2. A short label describing the user-visible intent.
+3. A snippet of the current page HTML.
+
+Return ONLY a JSON object: { "selector": "<new selector>" }
+Rules:
+- Selector must be a single Playwright-compatible selector that uniquely matches the intended element on this page.
+- Strongly prefer text-engine selectors like "text=Sign in" or "text=/^Search/i" for buttons/links/labels.
+- For inputs, prefer attribute selectors: input[name='q'], [aria-label='Search'], [placeholder*='Search'], input[type='email'].
+- Do not invent class names. Use only attributes/text you can see in the HTML.
+- If nothing in the HTML matches the intent, return { "selector": "" }.`
+        const usr = `Failing action: ${JSON.stringify(failedAction)}
+Intent: ${intentLabel}
+
+HTML snippet:
+${trimmedHtml}`
+        const raw = await callFireworks(
+          [{ role: 'system', content: sys }, { role: 'user', content: usr }],
+          { temperature: 0, json: true, max_tokens: 200 }
+        )
+        const obj = JSON.parse(stripJsonFence(raw))
+        const sel = String(obj?.selector || '').trim()
+        return sel || null
+      } catch { return null }
+    }
+
     function pickScreenshot(scrape) {
       const fromActions = scrape?.actions?.screenshots
       if (Array.isArray(fromActions) && fromActions.length) {
@@ -686,9 +720,47 @@ app.post('/api/run-stream', async (req, res) => {
             if (shot) { lastShot = shot; send('frame', { image: shot, actionIndex: i }) }
             ok = true
           } catch (err2) {
-            // Drop the failed action from replay so subsequent steps still run from last good state.
-            replay.pop()
-            send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `! ${label} skipped: ${String(err2.message || err2).slice(0, 80)}` })
+            // Self-healing: only relevant for selector-based actions (click/wait-for).
+            let healed = false
+            if ((sa.type === 'click' || (sa.type === 'wait' && sa.selector))) {
+              try {
+                send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `repairing selector for ${label}…` })
+                // Grab current page HTML by replaying prior good actions only.
+                const ctx = await fcScrape({
+                  url: plan.url,
+                  actions: [...replay.slice(0, -1), { type: 'wait', milliseconds: 600 }],
+                  formats: ['html'],
+                  onlyMain: false,
+                })
+                const newSel = await repairSelector({
+                  failedAction: sa,
+                  intentLabel: label,
+                  html: ctx?.html || '',
+                })
+                if (newSel) {
+                  const fixed = { ...sa, selector: newSel }
+                  const heal = [
+                    ...replay.slice(0, -1),
+                    { type: 'wait', milliseconds: 800 },
+                    fixed,
+                    { type: 'wait', milliseconds: 500 },
+                    { type: 'screenshot' },
+                  ]
+                  const scrape3 = await fcScrape({ url: plan.url, actions: heal, formats, onlyMain: false })
+                  lastScrape = scrape3
+                  const shot3 = pickScreenshot(scrape3)
+                  if (shot3) { lastShot = shot3; send('frame', { image: shot3, actionIndex: i }) }
+                  // Replace the failed action in replay with the healed one.
+                  replay[replay.length - 1] = fixed
+                  healed = true
+                  send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `${label} (repaired → ${newSel.slice(0, 40)})` })
+                }
+              } catch { /* fall through to skip */ }
+            }
+            if (!healed) {
+              replay.pop()
+              send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `! ${label} skipped: ${String(err2.message || err2).slice(0, 80)}` })
+            }
           }
         }
         await sleep(120)
