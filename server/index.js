@@ -567,165 +567,155 @@ app.post('/api/run-stream', async (req, res) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`)
   }
 
+  let sessionId = null
   try {
     if (!FIRECRAWL_API_KEY) { send('error', { error: 'FIRECRAWL_API_KEY missing' }); return res.end() }
     const { plan } = req.body || {}
     if (!plan || !plan.url) { send('error', { error: 'plan with url required' }); return res.end() }
 
-    const { actions: fcActions, frameMap } = buildStreamingActions(plan.actions)
-
     send('start', { url: plan.url, totalActions: plan.actions.length })
-
     const start = Date.now()
 
-    // ---- Quick preview screenshot for instant visual feedback ----
-    // Fire a fast Firecrawl call (no actions) so the user sees the start
-    // page within a few seconds, while the full action run is dispatched
-    // in parallel and replaces these frames as it completes.
-    const previewPromise = (async () => {
-      try {
-        const pr = await fetch('https://api.firecrawl.dev/v1/scrape', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
-          body: JSON.stringify({
-            url: plan.url,
-            formats: ['screenshot'],
-            onlyMainContent: false,
-            waitFor: 400,
-            timeout: 30000,
-          }),
-        })
-        const pt = await pr.text()
-        const pd = JSON.parse(pt)
-        const shot = pd?.data?.screenshot || pd?.screenshot
-        if (shot) {
-          send('cursor', { actionIndex: -1, x: 0.5, y: 0.5, label: 'page loaded — planning first action' })
-          send('frame', { actionIndex: -1, image: shot, preview: true })
-        }
-      } catch { /* preview is best-effort */ }
-    })()
-
-    // Periodic browser preview while Firecrawl is running the full plan.
-    // Each tick fires a fast screenshot-only call against the start URL so the
-    // live view actually changes (catches dynamic content, ads, animations,
-    // any client-side updates) instead of staying frozen on a single frame.
-    const phrases = ['analysing DOM', 'locating elements', 'preparing actions', 'executing plan', 'awaiting response']
-    let hbIdx = 0
-    let previewBusy = false
-    let cancelled = false
-    const heartbeat = setInterval(async () => {
-      try {
-        send('cursor', {
-          actionIndex: -1,
-          x: 0.4 + Math.random() * 0.2,
-          y: 0.3 + Math.random() * 0.4,
-          label: phrases[hbIdx++ % phrases.length],
-        })
-      } catch {}
-      if (previewBusy || cancelled) return
-      previewBusy = true
-      try {
-        const pr = await fetch('https://api.firecrawl.dev/v1/scrape', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
-          body: JSON.stringify({
-            url: plan.url,
-            formats: ['screenshot'],
-            onlyMainContent: false,
-            waitFor: 200,
-            timeout: 20000,
-          }),
-        })
-        const pt = await pr.text()
-        const pd = JSON.parse(pt)
-        const shot = pd?.data?.screenshot || pd?.screenshot
-        if (shot && !cancelled) send('frame', { actionIndex: -1, image: shot, preview: true })
-      } catch { /* best effort */ }
-      previewBusy = false
-    }, 4000)
-
-    const body = {
-      url: plan.url,
-      formats: ['markdown', 'html', 'screenshot'],
-      onlyMainContent: false,
-      waitFor: 800,
-      timeout: 90000,
-      actions: fcActions,
-    }
-    const r = await fetch('https://api.firecrawl.dev/v1/scrape', {
+    // ---- 1. Create a Browser Sandbox session for true live streaming ----
+    const createR = await fetch('https://api.firecrawl.dev/v2/browser', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ttl: 600, activityTtl: 180 }),
     })
-    cancelled = true
-    clearInterval(heartbeat)
-    await previewPromise.catch(() => {})
-    const text = await r.text()
-    let data
-    try { data = JSON.parse(text) } catch {
-      send('error', { error: `Firecrawl returned non-JSON (${r.status})` }); return res.end()
+    const createTxt = await createR.text()
+    let session
+    try { session = JSON.parse(createTxt) } catch {
+      send('error', { error: `Browser create returned non-JSON (${createR.status}): ${createTxt.slice(0, 200)}` }); return res.end()
     }
-    if (!r.ok || data.success === false) {
-      send('error', { error: `Firecrawl ${r.status}: ${data?.error || text.slice(0, 200)}` }); return res.end()
+    if (!createR.ok || session.success === false || !session.id) {
+      send('error', { error: `Browser create ${createR.status}: ${session?.error || createTxt.slice(0, 200)}` }); return res.end()
     }
-    const scrape = data.data || data
-    const shots = (scrape.actions && scrape.actions.screenshots) || []
-    // Fallback: if no per-action shots, use the final screenshot once.
-    const fallbackShot = scrape.screenshot || null
+    sessionId = session.id
+    const liveUrl = session.interactiveLiveViewUrl || session.liveViewUrl
+    send('liveview', { url: liveUrl })
 
-    let prevCursor = { x: 0.5, y: 0.5 }
-    let shotIdx = 0
-    for (let i = 0; i < frameMap.length; i++) {
-      const f = frameMap[i]
-      const img = shots[shotIdx++] || fallbackShot
-      if (!img) continue
+    // ---- 2. Helper to execute Playwright code in the session ----
+    async function exec(code) {
+      const er = await fetch(`https://api.firecrawl.dev/v2/browser/${sessionId}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
+        body: JSON.stringify({ code, language: 'node' }),
+      })
+      const et = await er.text()
+      let ed
+      try { ed = JSON.parse(et) } catch { throw new Error(`exec non-JSON (${er.status}): ${et.slice(0, 200)}`) }
+      if (!er.ok || ed.success === false) throw new Error(`exec ${er.status}: ${ed?.error || et.slice(0, 200)}`)
+      return ed.result ?? ed.data ?? ed
+    }
 
-      if (f.actionIndex >= 0) {
-        const action = plan.actions[f.actionIndex]
-        const cursor = estimateCursor(action, prevCursor)
-        prevCursor = cursor
-        send('cursor', {
-          actionIndex: f.actionIndex,
-          action,
-          x: cursor.x,
-          y: cursor.y,
-          label: action.type === 'click' ? `click ${action.selector || ''}`
-               : action.type === 'write' ? `type "${action.text || ''}"`
-               : action.type === 'press' ? `press ${action.key || ''}`
-               : action.type === 'scroll' ? `scroll ${action.direction || 'down'}`
-               : action.type,
-        })
-        await sleep(220)
-      } else {
-        send('cursor', { actionIndex: -1, x: 0.5, y: 0.5, label: 'loading page' })
-        await sleep(120)
+    // ---- 3. Navigate to start URL ----
+    send('cursor', { actionIndex: -1, x: 0.5, y: 0.1, label: `navigating to ${plan.url}` })
+    await exec(`await page.goto(${JSON.stringify(plan.url)}, { waitUntil: 'domcontentloaded', timeout: 45000 }); return { url: page.url() };`)
+
+    // ---- 4. Run actions one at a time, streaming a cursor event per step ----
+    let prev = { x: 0.5, y: 0.5 }
+    for (let i = 0; i < plan.actions.length; i++) {
+      const a = plan.actions[i]
+      const sanitized = sanitizeAction(a)
+      for (const sa of sanitized) {
+        let label = sa.type
+        if (sa.type === 'click') label = `click ${sa.selector || ''}`
+        else if (sa.type === 'write') label = `type "${sa.text || ''}"`
+        else if (sa.type === 'press') label = `press ${sa.key || 'Enter'}`
+        else if (sa.type === 'scroll') label = `scroll ${sa.direction || 'down'}`
+        else if (sa.type === 'wait') label = sa.selector ? `wait for ${sa.selector}` : `wait ${sa.milliseconds || 0}ms`
+
+        // Try to find real coordinates for click targets so the cursor overlay aligns with the live view.
+        let cursor = estimateCursor(a, prev)
+        if (sa.type === 'click' && sa.selector) {
+          try {
+            const r = await exec(
+              `try {
+                 const loc = page.locator(${JSON.stringify(sa.selector)}).first();
+                 await loc.waitFor({ timeout: 5000, state: 'visible' });
+                 const b = await loc.boundingBox();
+                 const vp = page.viewportSize();
+                 return { bbox: b, vp };
+               } catch (e) { return { error: String(e.message||e) }; }`
+            )
+            const vp = r?.vp || { width: 1280, height: 720 }
+            const bb = r?.bbox
+            if (bb) cursor = {
+              x: Math.max(0, Math.min(1, (bb.x + bb.width / 2) / vp.width)),
+              y: Math.max(0, Math.min(1, (bb.y + bb.height / 2) / vp.height)),
+            }
+          } catch { /* keep estimate */ }
+        }
+        prev = cursor
+        send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label })
+        await sleep(180)
+
+        try {
+          if (sa.type === 'click') {
+            await exec(`await page.locator(${JSON.stringify(sa.selector)}).first().click({ timeout: 10000 }); return {};`)
+          } else if (sa.type === 'write') {
+            await exec(`await page.keyboard.type(${JSON.stringify(sa.text || '')}, { delay: 25 }); return {};`)
+          } else if (sa.type === 'press') {
+            await exec(`await page.keyboard.press(${JSON.stringify(sa.key || 'Enter')}); return {};`)
+          } else if (sa.type === 'wait') {
+            if (sa.selector) {
+              await exec(`await page.waitForSelector(${JSON.stringify(sa.selector)}, { timeout: 15000 }); return {};`)
+            } else {
+              await exec(`await page.waitForTimeout(${Math.max(50, Number(sa.milliseconds) || 500)}); return {};`)
+            }
+          } else if (sa.type === 'scroll') {
+            const dy = sa.direction === 'up' ? -600 : 600
+            await exec(`await page.evaluate(() => window.scrollBy(0, ${dy})); return {};`)
+          } else if (sa.type === 'screenshot' || sa.type === 'scrape') {
+            // No-op: live view shows everything in real time.
+          }
+        } catch (err) {
+          send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `! ${label} failed` })
+        }
       }
-
-      send('frame', { actionIndex: f.actionIndex, image: img })
-      await sleep(140)
     }
 
-    const durationMs = Date.now() - start
-    const expectations = evaluateExpectations(plan, scrape)
-    const passed = expectations.length === 0 ? true : expectations.every((e) => e.pass)
-    const finalUrl = scrape.metadata?.sourceURL || scrape.metadata?.url || plan.url
-    const title = scrape.metadata?.title || ''
+    // ---- 5. Capture final state for assertions ----
+    send('cursor', { actionIndex: -1, x: 0.5, y: 0.5, label: 'evaluating assertions' })
+    let finalState = { url: plan.url, title: '', html: '', text: '' }
+    try {
+      finalState = await exec(
+        `await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(()=>{});
+         const html = await page.content();
+         const text = await page.evaluate(() => document.body ? document.body.innerText : '');
+         return { url: page.url(), title: await page.title(), html, text };`
+      )
+    } catch {}
 
-    const screenshots = []
-    if (scrape.screenshot) screenshots.push(scrape.screenshot)
-    for (const s of shots) screenshots.push(s)
+    const fakeScrape = {
+      html: finalState.html || '',
+      markdown: finalState.text || '',
+      metadata: { sourceURL: finalState.url, title: finalState.title },
+    }
+    const expectations = evaluateExpectations(plan, fakeScrape)
+    const passed = expectations.length === 0 ? true : expectations.every((e) => e.pass)
+    const durationMs = Date.now() - start
+    const finalUrl = finalState.url || plan.url
+    const title = finalState.title || ''
 
     send('summary_start', { passed, expectations, finalUrl, title, durationMs })
     const summary = await streamSummaryRun(
       { plan, finalUrl, title, expectations, passed, durationMs },
       (delta) => send('summary_delta', { delta })
     )
-    send('done', { summary, expectations, passed, finalUrl, title, durationMs, screenshots })
+    send('done', { summary, expectations, passed, finalUrl, title, durationMs, screenshots: [] })
     res.end()
   } catch (err) {
     console.error('run-stream error:', err)
     try { send('error', { error: String(err.message || err) }) } catch {}
     res.end()
+  } finally {
+    if (sessionId) {
+      fetch(`https://api.firecrawl.dev/v2/browser/${sessionId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
+      }).catch(() => {})
+    }
   }
 })
 

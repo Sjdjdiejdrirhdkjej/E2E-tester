@@ -102,7 +102,13 @@ export default function App() {
     try {
       await streamRun(plan, {
         start: () => {
-          update(id, { stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'opening page…', actionIndex: -1 } })
+          update(id, { stage: { image: null, liveUrl: null, cursor: { x: 0.5, y: 0.5 }, label: 'spinning up browser…', actionIndex: -1 } })
+        },
+        liveview: (p) => {
+          setTests((prev) => prev.map((t) => t.id === id ? {
+            ...t,
+            stage: { ...(t.stage || {}), liveUrl: p.url, label: 'live browser ready' }
+          } : t))
         },
         cursor: (p) => {
           setTests((prev) => prev.map((t) => t.id === id ? {
@@ -589,7 +595,14 @@ function LiveStage({ stage, status }) {
         </span>
       </div>
       <div className="stage-frame">
-        {stage?.image ? (
+        {stage?.liveUrl ? (
+          <iframe
+            className="stage-iframe"
+            src={stage.liveUrl}
+            title="live browser"
+            allow="fullscreen; clipboard-read; clipboard-write"
+          />
+        ) : stage?.image ? (
           <img className="stage-img" src={stage.image} alt="live" />
         ) : (
           <div className="stage-blank">
