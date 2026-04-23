@@ -567,51 +567,69 @@ app.post('/api/run-stream', async (req, res) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`)
   }
 
-  let browser = null
-  let context = null
-  let page = null
-  let frameTimer = null
-  const stopFrames = () => { if (frameTimer) { clearInterval(frameTimer); frameTimer = null } }
   try {
+    if (!FIRECRAWL_API_KEY) { send('error', { error: 'FIRECRAWL_API_KEY missing' }); return res.end() }
     const { plan } = req.body || {}
     if (!plan || !plan.url) { send('error', { error: 'plan with url required' }); return res.end() }
 
     send('start', { url: plan.url, totalActions: plan.actions.length })
     const start = Date.now()
 
-    // ---- 1. Launch local headless Chromium via Playwright ----
-    const { chromium } = await import('playwright-chromium')
-    browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] })
-    context = await browser.newContext({ viewport: { width: 1280, height: 720 } })
-    page = await context.newPage()
+    // ---- Firecrawl-only progressive streaming ----
+    // We can't keep a session across HTTP calls on standard Firecrawl plans, so
+    // we replay all prior actions on each step and capture a screenshot at the
+    // end. The user sees one new frame per planned action, plus an animated
+    // cursor between frames. Slower than a true live stream, but it works on
+    // any Firecrawl plan and on deployment without local browsers.
 
-    // ---- 2. Live frame streaming via periodic JPEG screenshots over SSE ----
-    let frameActionIndex = -1
-    let framesInFlight = false
-    async function captureFrame() {
-      if (framesInFlight || !page || page.isClosed()) return
-      framesInFlight = true
-      try {
-        const buf = await page.screenshot({ type: 'jpeg', quality: 55, fullPage: false, timeout: 4000 })
-        const image = 'data:image/jpeg;base64,' + buf.toString('base64')
-        send('frame', { image, actionIndex: frameActionIndex })
-      } catch { /* ignore transient screenshot errors */ } finally {
-        framesInFlight = false
+    async function fcScrape({ url, actions, formats = ['screenshot'], onlyMain = false }) {
+      const body = {
+        url,
+        formats,
+        onlyMainContent: onlyMain,
+        waitFor: 600,
+        timeout: 60000,
+        actions,
       }
+      const r = await fetch('https://api.firecrawl.dev/v1/scrape', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
+        body: JSON.stringify(body),
+      })
+      const text = await r.text()
+      let data
+      try { data = JSON.parse(text) } catch {
+        throw new Error(`Firecrawl returned non-JSON (${r.status}): ${text.slice(0, 200)}`)
+      }
+      if (!r.ok || data.success === false) {
+        throw new Error(`Firecrawl ${r.status}: ${data?.error || text.slice(0, 200)}`)
+      }
+      return data.data || data
     }
-    frameTimer = setInterval(() => { captureFrame().catch(() => {}) }, 500)
 
-    // ---- 3. Navigate to start URL ----
-    send('cursor', { actionIndex: -1, x: 0.5, y: 0.1, label: `navigating to ${plan.url}` })
+    function pickScreenshot(scrape) {
+      const fromActions = scrape?.actions?.screenshots
+      if (Array.isArray(fromActions) && fromActions.length) {
+        return fromActions[fromActions.length - 1]
+      }
+      return scrape?.screenshot || null
+    }
+
+    // ---- 1. Initial frame: just open the URL with one screenshot ----
+    send('cursor', { actionIndex: -1, x: 0.5, y: 0.1, label: `opening ${plan.url}` })
+    let lastShot = null
     try {
-      await page.goto(plan.url, { waitUntil: 'domcontentloaded', timeout: 45000 })
+      const initial = await fcScrape({ url: plan.url, actions: [{ type: 'screenshot' }] })
+      lastShot = pickScreenshot(initial)
+      if (lastShot) send('frame', { image: lastShot, actionIndex: -1 })
     } catch (err) {
-      send('cursor', { actionIndex: -1, x: 0.5, y: 0.1, label: `! navigation issue: ${String(err.message || err).slice(0, 80)}` })
+      send('cursor', { actionIndex: -1, x: 0.5, y: 0.1, label: `! open failed: ${String(err.message || err).slice(0, 80)}` })
     }
-    await captureFrame()
 
-    // ---- 4. Run actions one at a time, streaming a cursor event per step ----
+    // ---- 2. Walk through actions, replaying prior steps each call ----
+    const replay = [] // accumulated sanitized actions executed so far
     let prev = { x: 0.5, y: 0.5 }
+    let lastScrape = null
     for (let i = 0; i < plan.actions.length; i++) {
       const a = plan.actions[i]
       const sanitized = sanitizeAction(a)
@@ -622,93 +640,62 @@ app.post('/api/run-stream', async (req, res) => {
         else if (sa.type === 'press') label = `press ${sa.key || 'Enter'}`
         else if (sa.type === 'scroll') label = `scroll ${sa.direction || 'down'}`
         else if (sa.type === 'wait') label = sa.selector ? `wait for ${sa.selector}` : `wait ${sa.milliseconds || 0}ms`
+        else if (sa.type === 'screenshot' || sa.type === 'scrape') continue // we always shoot at end
 
-        // Try to find real coordinates for click targets so the overlay aligns with the live view.
-        let cursor = estimateCursor(a, prev)
-        if (sa.type === 'click' && sa.selector) {
-          try {
-            const loc = page.locator(sa.selector).first()
-            await loc.waitFor({ timeout: 5000, state: 'visible' }).catch(() => {})
-            const bb = await loc.boundingBox().catch(() => null)
-            const vp = page.viewportSize() || { width: 1280, height: 720 }
-            if (bb) cursor = {
-              x: Math.max(0, Math.min(1, (bb.x + bb.width / 2) / vp.width)),
-              y: Math.max(0, Math.min(1, (bb.y + bb.height / 2) / vp.height)),
-            }
-          } catch { /* keep estimate */ }
-        }
+        const cursor = estimateCursor(a, prev)
         prev = cursor
-        frameActionIndex = i
         send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label })
-        await sleep(180)
 
+        replay.push(sa)
         try {
-          if (sa.type === 'click') {
-            await page.locator(sa.selector).first().click({ timeout: 10000 })
-          } else if (sa.type === 'write') {
-            await page.keyboard.type(sa.text || '', { delay: 25 })
-          } else if (sa.type === 'press') {
-            await page.keyboard.press(sa.key || 'Enter')
-          } else if (sa.type === 'wait') {
-            if (sa.selector) {
-              await page.waitForSelector(sa.selector, { timeout: 15000 })
-            } else {
-              await page.waitForTimeout(Math.max(50, Number(sa.milliseconds) || 500))
-            }
-          } else if (sa.type === 'scroll') {
-            const dy = sa.direction === 'up' ? -600 : 600
-            await page.evaluate((d) => window.scrollBy(0, d), dy)
+          const stepActions = [...replay, { type: 'wait', milliseconds: 400 }, { type: 'screenshot' }]
+          const isLast = i === plan.actions.length - 1
+          const formats = isLast ? ['markdown', 'html', 'screenshot'] : ['screenshot']
+          const scrape = await fcScrape({ url: plan.url, actions: stepActions, formats, onlyMain: false })
+          lastScrape = scrape
+          const shot = pickScreenshot(scrape)
+          if (shot) {
+            lastShot = shot
+            send('frame', { image: shot, actionIndex: i })
           }
         } catch (err) {
-          send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `! ${label} failed` })
+          send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `! ${label} failed: ${String(err.message || err).slice(0, 80)}` })
         }
-        await captureFrame()
+        await sleep(120)
       }
     }
 
-    // ---- 5. Capture final state for assertions ----
-    frameActionIndex = -1
+    // ---- 3. If we never got a full scrape (e.g. no actions), do one now ----
+    if (!lastScrape || !lastScrape.html) {
+      try {
+        lastScrape = await fcScrape({
+          url: plan.url,
+          actions: [...replay, { type: 'wait', milliseconds: 400 }, { type: 'screenshot' }],
+          formats: ['markdown', 'html', 'screenshot'],
+        })
+        const shot = pickScreenshot(lastScrape)
+        if (shot) { lastShot = shot; send('frame', { image: shot, actionIndex: -1 }) }
+      } catch {}
+    }
+
     send('cursor', { actionIndex: -1, x: 0.5, y: 0.5, label: 'evaluating assertions' })
-    stopFrames()
-    await captureFrame()
-    let finalState = { url: plan.url, title: '', html: '', text: '' }
-    try {
-      await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {})
-      finalState = {
-        url: page.url(),
-        title: await page.title().catch(() => ''),
-        html: await page.content().catch(() => ''),
-        text: await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => ''),
-      }
-    } catch {}
-
-    const fakeScrape = {
-      html: finalState.html || '',
-      markdown: finalState.text || '',
-      metadata: { sourceURL: finalState.url, title: finalState.title },
-    }
-    const expectations = evaluateExpectations(plan, fakeScrape)
+    const expectations = evaluateExpectations(plan, lastScrape || {})
     const passed = expectations.length === 0 ? true : expectations.every((e) => e.pass)
     const durationMs = Date.now() - start
-    const finalUrl = finalState.url || plan.url
-    const title = finalState.title || ''
+    const finalUrl = lastScrape?.metadata?.sourceURL || lastScrape?.metadata?.url || plan.url
+    const title = lastScrape?.metadata?.title || ''
 
     send('summary_start', { passed, expectations, finalUrl, title, durationMs })
     const summary = await streamSummaryRun(
       { plan, finalUrl, title, expectations, passed, durationMs },
       (delta) => send('summary_delta', { delta })
     )
-    send('done', { summary, expectations, passed, finalUrl, title, durationMs, screenshots: [] })
+    send('done', { summary, expectations, passed, finalUrl, title, durationMs, screenshots: lastShot ? [lastShot] : [] })
     res.end()
   } catch (err) {
     console.error('run-stream error:', err)
     try { send('error', { error: String(err.message || err) }) } catch {}
     res.end()
-  } finally {
-    stopFrames()
-    try { if (page && !page.isClosed()) await page.close() } catch {}
-    try { if (context) await context.close() } catch {}
-    try { if (browser) await browser.close() } catch {}
   }
 })
 
