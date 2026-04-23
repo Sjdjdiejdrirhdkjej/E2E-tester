@@ -561,7 +561,7 @@ export default function App() {
           <div className="scroll">
             <div className="hero">
               <h1 className="hello">Hello, <span className="accent">what shall we test today?</span></h1>
-              <p className="subhello">Describe a user scenario in plain English. Plan mode uses GLM 5.1 (max reasoning on Fireworks): it can only call create_plan to brief the act agent, otherwise it asks in plain text; Firecrawl runs the test in a real browser.</p>
+              <p className="subhello">Just describe it, and consider it done.</p>
               <PromptBox
                 value={draft}
                 onChange={setDraft}
