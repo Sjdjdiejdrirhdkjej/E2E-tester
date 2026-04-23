@@ -11,7 +11,10 @@ const HOST = SERVE_STATIC ? '0.0.0.0' : '127.0.0.1'
 const FIREWORKS_API_KEY = process.env.FIREWORKS_API_KEY
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY
 /** Model for JSON test planning + post-run summary ("act" path). */
-const FIREWORKS_ACT_MODEL = process.env.FIREWORKS_MODEL || 'accounts/fireworks/models/kimi-k2p6'
+const FIREWORKS_ACT_MODEL =
+  process.env.FIREWORKS_ACT_MODEL ||
+  process.env.FIREWORKS_MODEL ||
+  'accounts/fireworks/models/kimi-k2p6'
 /** Vision-capable model used for the agentic loop so it can actually look at the screenshot.
  *  Override with FIREWORKS_AGENT_MODEL. Default: Kimi K2.6 (latest non-Llama multimodal + tool use). */
 const FIREWORKS_AGENT_MODEL =
@@ -32,6 +35,7 @@ app.get('/api/health', (_req, res) => {
     firecrawl: Boolean(FIRECRAWL_API_KEY),
     db: dbReady,
     actModel: FIREWORKS_ACT_MODEL,
+    agentModel: FIREWORKS_AGENT_MODEL,
     planModel: FIREWORKS_PLAN_MODEL,
     planReasoning: FIREWORKS_PLAN_REASONING,
   })

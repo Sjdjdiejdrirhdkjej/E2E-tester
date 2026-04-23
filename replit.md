@@ -7,7 +7,9 @@ was empty on import, so this is a fresh scaffold.
 - React 18 + Vite 5 (JSX, no TypeScript)
 - Express 5 backend on port 8000 (proxied via `/api` from Vite)
 - AI planner: Fireworks AI — Kimi K2.6 (`accounts/fireworks/models/kimi-k2p6`)
-  - Override with `FIREWORKS_MODEL` env var
+  - Override with `FIREWORKS_ACT_MODEL` (or legacy `FIREWORKS_MODEL`) env var
+- Plan-mode strategist model: `FIREWORKS_PLAN_MODEL` (default `accounts/fireworks/models/glm-5p1`)
+- Agent-loop model: `FIREWORKS_AGENT_MODEL` (default `accounts/fireworks/models/kimi-k2p6`)
 - Browser execution: Firecrawl `/v1/scrape` with `actions`
 
 ## Layout
