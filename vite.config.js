@@ -8,6 +8,16 @@ export default defineConfig({
     port: 5000,
     allowedHosts: true,
     hmr: { clientPort: 443 },
+    watch: {
+      ignored: [
+        '**/.cache/**',
+        '**/.local/**',
+        '**/.git/**',
+        '**/.agents/**',
+        '**/node_modules/**',
+        '**/dist/**',
+      ],
+    },
     proxy: {
       '/api': {
         target: 'http://localhost:8000',
