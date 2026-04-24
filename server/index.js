@@ -570,7 +570,7 @@ async function runFirecrawl(plan) {
     onlyMainContent: false,
     waitFor: 800,
     timeout: 60000,
-    actions,
+    actions: toFirecrawlActions(actions),
   }
   const r = await fetch('https://api.firecrawl.dev/v1/scrape', {
     method: 'POST',
@@ -710,6 +710,45 @@ async function endRun(taskId, status) {
   setTimeout(() => { runRegistry.delete(taskId) }, 10 * 60 * 1000).unref?.()
 }
 
+// Shared JS helpers injected into every page-side script: element resolution
+// (CSS + Playwright text=/text=/re/i/text='x' engine) and a visibility test.
+// Defined once so `selectorRectScript` and `browserUseClickScript` stay in
+// sync instead of drifting apart.
+const FIND_ELEMENT_JS = `
+function __isVisible(el) {
+  var r = el.getBoundingClientRect();
+  if (r.width < 2 || r.height < 2) return false;
+  var s = window.getComputedStyle(el);
+  if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity || '1') < 0.05) return false;
+  return true;
+}
+function __findText(s) {
+  var needle = s.slice(5).trim();
+  var regex = null;
+  var m = needle.match(/^\\/(.*)\\/([a-z]*)$/);
+  if (m) { try { regex = new RegExp(m[1], (m[2]||'').indexOf('i') >= 0 ? 'i' : ''); } catch (e) {} }
+  else {
+    if ((needle.charAt(0) === '"' && needle.charAt(needle.length-1) === '"') ||
+        (needle.charAt(0) === "'" && needle.charAt(needle.length-1) === "'")) {
+      needle = needle.slice(1, -1);
+    }
+  }
+  var tags = 'a,button,[role="button"],[role="link"],[role="tab"],[role="menuitem"],span,div,h1,h2,h3,h4,h5,li,label,option,p,input,textarea,summary,th,td';
+  var all = Array.from(document.querySelectorAll(tags));
+  function match(t) { return regex ? regex.test(t) : (t === needle || t.toLowerCase() === needle.toLowerCase()); }
+  for (var i = 0; i < all.length; i++) { var t = (all[i].innerText || all[i].textContent || '').trim(); if (match(t) && __isVisible(all[i])) return all[i]; }
+  if (!regex) {
+    var n = needle.toLowerCase();
+    for (var k = 0; k < all.length; k++) { var t2 = (all[k].innerText || all[k].textContent || '').trim().toLowerCase(); if (t2.indexOf(n) >= 0 && __isVisible(all[k])) return all[k]; }
+  }
+  return null;
+}
+function __findElement(sel) {
+  if (/^text=/i.test(sel)) return __findText(sel);
+  try { return document.querySelector(sel); } catch (e) { return null; }
+}
+`
+
 // Build a JS snippet for Firecrawl's `executeJavascript` action that returns
 // the bounding rect of a selector + the viewport size. Handles plain CSS
 // selectors and Playwright text-engine selectors (text=Foo, text=/foo/i).
@@ -719,44 +758,175 @@ function selectorRectScript(selectorRaw) {
   const j = JSON.stringify(sel)
   return `(function(){
 try {
+  ${FIND_ELEMENT_JS}
   var sel = ${j};
-  function findText(s) {
-    var needle = s.slice(5).trim();
-    var regex = null;
-    var m = needle.match(/^\\/(.*)\\/([a-z]*)$/);
-    if (m) { try { regex = new RegExp(m[1], (m[2]||'').indexOf('i') >= 0 ? 'i' : ''); } catch (e) {} }
-    else {
-      if ((needle.charAt(0) === '"' && needle.charAt(needle.length-1) === '"') ||
-          (needle.charAt(0) === "'" && needle.charAt(needle.length-1) === "'")) {
-        needle = needle.slice(1, -1);
-      }
-    }
-    var tags = 'a,button,[role="button"],[role="link"],[role="tab"],[role="menuitem"],span,div,h1,h2,h3,h4,h5,li,label,option,p,input,textarea,summary,th,td';
-    var all = Array.from(document.querySelectorAll(tags));
-    function visible(el) {
-      var r = el.getBoundingClientRect();
-      if (r.width < 2 || r.height < 2) return false;
-      var s = window.getComputedStyle(el);
-      if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity || '1') < 0.05) return false;
-      return true;
-    }
-    function match(t) { return regex ? regex.test(t) : (t === needle || t.toLowerCase() === needle.toLowerCase()); }
-    for (var i = 0; i < all.length; i++) { var t = (all[i].innerText || all[i].textContent || '').trim(); if (match(t) && visible(all[i])) return all[i]; }
-    if (!regex) {
-      var n = needle.toLowerCase();
-      for (var k = 0; k < all.length; k++) { var t2 = (all[k].innerText || all[k].textContent || '').trim().toLowerCase(); if (t2.indexOf(n) >= 0 && visible(all[k])) return all[k]; }
-    }
-    return null;
-  }
-  var el = null;
-  if (/^text=/i.test(sel)) { el = findText(sel); }
-  else { try { el = document.querySelector(sel); } catch (e) { el = null; } }
+  var el = __findElement(sel);
   var vp = { w: window.innerWidth || document.documentElement.clientWidth, h: window.innerHeight || document.documentElement.clientHeight };
   if (!el) { return { found: false, viewport: vp, selector: sel }; }
   var r = el.getBoundingClientRect();
   return { found: true, x: r.x, y: r.y, w: r.width, h: r.height, viewport: vp, selector: sel };
 } catch (e) { return { found: false, error: String(e && e.message || e) }; }
 })()`
+}
+
+// Browser-use style click, ported to run inside Firecrawl's page context via
+// the `executeJavascript` action. Mirrors browser-use's `_click_element_node`
+// (github.com/browser-use/browser-use) but adapted for a JS-only runtime where
+// we can't issue real CDP mouse events:
+//
+//   1. Resolve element (CSS selector OR Playwright text= / text=/re/i / text='x')
+//   2. scrollIntoViewIfNeeded (center fallback)
+//   3. Visibility + zero-size checks (bail with reason)
+//   4. Focus inputs/selects/contenteditable
+//   5. Dispatch the full pointer/mouse sequence at element center
+//      (pointerover/enter → mouseover/enter → pointerdown/mousedown → pointerup/mouseup)
+//      — many SPAs only bind to pointer* events, so native el.click() alone misses them.
+//   6. Call el.click() so default actions (form submit, <a> nav, checkbox toggle) fire.
+//      — This is browser-use's JS-click fallback; here we always run it because
+//        we can't do a "real" CDP click. Skipping the manual 'click' dispatch
+//        before el.click() avoids double-firing.
+//
+// Return value has no `viewport` field, so `parseRectFromScrape` still finds
+// the rect-probe return in the same call.
+//
+// Runtime assumption: Firecrawl's `executeJavascript` action awaits a Promise
+// returned by the script (true for Playwright's page.evaluate underneath).
+// We rely on this for the wait-for-element retry loop; if the assumption
+// ever breaks, the click still fires on the first pass inside the async
+// IIFE's microtask, just without the retry budget.
+function browserUseClickScript(selectorRaw) {
+  const sel = String(selectorRaw || '')
+  const j = JSON.stringify(sel)
+  return `(async function(){
+try {
+  ${FIND_ELEMENT_JS}
+  var sel = ${j};
+
+  // --- 1. Wait-for-element (mirrors Playwright/browser-use's implicit wait). ---
+  // Async-rendered elements appear after the initial DOM is ready, so poll for
+  // up to ~1.5s before giving up. Uses setTimeout (not a busy-loop) so the
+  // page keeps loading. Firecrawl's executeJavascript awaits returned Promises.
+  var el = null;
+  var deadline = Date.now() + 1500;
+  while (true) {
+    el = __findElement(sel);
+    if (el) break;
+    if (Date.now() >= deadline) break;
+    await new Promise(function (r) { setTimeout(r, 100); });
+  }
+  if (!el) return { ok: false, reason: 'not_found', selector: sel };
+
+  // --- 2. scroll into view ---
+  try {
+    if (typeof el.scrollIntoViewIfNeeded === 'function') el.scrollIntoViewIfNeeded();
+    else el.scrollIntoView({ block: 'center', inline: 'center' });
+  } catch (e) {}
+  // Give layout a tick to settle after a scroll.
+  await new Promise(function (r) { setTimeout(r, 60); });
+
+  // --- 3. disabled / visibility / size checks ---
+  if (el.disabled === true || el.getAttribute('aria-disabled') === 'true') {
+    return { ok: false, reason: 'disabled', selector: sel };
+  }
+  var style = window.getComputedStyle(el);
+  if (style.visibility === 'hidden' || style.display === 'none' || parseFloat(style.opacity || '1') < 0.05) {
+    return { ok: false, reason: 'hidden', selector: sel };
+  }
+  var rect = el.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1) {
+    return { ok: false, reason: 'zero_size', selector: sel };
+  }
+
+  // --- 4. focus inputs ---
+  var tag = (el.tagName || '').toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable) {
+    try { el.focus({ preventScroll: true }); } catch (e) { try { el.focus(); } catch (e2) {} }
+  }
+
+  // --- 5. synthetic pointer/mouse sequence at element center ---
+  var cx = rect.left + rect.width / 2;
+  var cy = rect.top + rect.height / 2;
+  var methods = [];
+  function fire(type) {
+    var opts = {
+      bubbles: true, cancelable: true, composed: true, view: window,
+      clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+      button: 0, buttons: type.indexOf('down') >= 0 ? 1 : 0
+    };
+    var Ev = null;
+    if (type.indexOf('pointer') === 0 && typeof PointerEvent === 'function') {
+      try { Ev = new PointerEvent(type, Object.assign({ pointerType: 'mouse', pointerId: 1, isPrimary: true }, opts)); } catch (e) {}
+    }
+    if (!Ev) {
+      var m = type.replace('pointer', 'mouse');
+      try { Ev = new MouseEvent(m, opts); } catch (e) { return; }
+    }
+    try { el.dispatchEvent(Ev); methods.push(type); } catch (e) {}
+  }
+  try {
+    fire('pointerover');  fire('pointerenter');
+    fire('mouseover');    fire('mouseenter');
+    fire('pointermove');  fire('mousemove');
+    fire('pointerdown');  fire('mousedown');
+    fire('pointerup');    fire('mouseup');
+  } catch (e) {}
+
+  // --- 6. el.click() for default actions (submit, nav, toggle) ---
+  // Deliberately skip fire('click') before this so native + synthetic don't double-fire.
+  var clicked = false;
+  try {
+    if (typeof el.click === 'function') { el.click(); methods.push('native'); clicked = true; }
+  } catch (e) { methods.push('native_error:' + String(e && e.message || e).slice(0, 80)); }
+  if (!clicked) {
+    // Last-ditch: synthesize a click event ourselves.
+    fire('click');
+  }
+
+  return {
+    ok: true,
+    methods: methods,
+    selector: sel,
+    tag: tag,
+    cx: cx, cy: cy,
+    href: (tag === 'a' && el.href) ? String(el.href).slice(0, 200) : null
+  };
+} catch (e) {
+  return { ok: false, reason: 'exception', error: String(e && e.message || e) };
+}
+})()`
+}
+
+// Translate sanitized plan actions into the exact payload Firecrawl's
+// /v1/scrape `actions` array expects. Right now the only translation we do
+// is swapping native `{type:'click', selector}` for an `executeJavascript`
+// action running the browser-use-style click above. Everything else passes
+// through untouched. This is applied at the fcScrape boundary so internal
+// pipeline metadata (burstActions probing `sa.type === 'click'`, log labels,
+// etc.) keeps working with the original sanitized shape.
+function toFirecrawlActions(actions) {
+  if (!Array.isArray(actions)) return actions
+  return actions.map((a) => {
+    if (a && a.type === 'click' && a.selector) {
+      return { type: 'executeJavascript', script: browserUseClickScript(a.selector) }
+    }
+    return a
+  })
+}
+
+// Pull the browser-use click-result (from `browserUseClickScript`) out of a
+// Firecrawl scrape response. Click results are objects WITHOUT a `viewport`
+// field, so we can distinguish them from rect-probe returns. Returns the
+// latest click result found, or null if none.
+function parseClickResultFromScrape(scrape) {
+  const list = scrape?.actions?.javascriptReturns || scrape?.actions?.javascript_returns || []
+  for (let k = list.length - 1; k >= 0; k--) {
+    const e = list[k]
+    const v = e?.return ?? e?.value ?? e?.result ?? (typeof e === 'object' ? e : null)
+    if (v && typeof v === 'object' && !v.viewport && typeof v.ok === 'boolean') {
+      return v
+    }
+  }
+  return null
 }
 
 // Pull the rect-probe return value out of a Firecrawl scrape response.
@@ -1205,7 +1375,7 @@ app.post('/api/run-agent', async (req, res) => {
       const r = await fetch('https://api.firecrawl.dev/v1/scrape', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${FIRECRAWL_API_KEY}` },
-        body: JSON.stringify({ url, formats, onlyMainContent: false, waitFor: 600, timeout: 60000, actions }),
+        body: JSON.stringify({ url, formats, onlyMainContent: false, waitFor: 600, timeout: 60000, actions: toFirecrawlActions(actions) }),
       })
       const text = await r.text()
       let data
@@ -1453,7 +1623,7 @@ app.post('/api/run-stream', async (req, res) => {
         onlyMainContent: onlyMain,
         waitFor: 600,
         timeout: 60000,
-        actions,
+        actions: toFirecrawlActions(actions),
       }
       const r = await fetch('https://api.firecrawl.dev/v1/scrape', {
         method: 'POST',
@@ -1622,9 +1792,22 @@ ${trimmedHtml}`
           }
           return null
         }
+        // The browser-use click script returns `{ok:false, reason}` silently
+        // rather than throwing on failure, so we have to inspect the JS
+        // return value and translate `ok:false` into a thrown error —
+        // otherwise Firecrawl sees the action as successful and the existing
+        // retry/repair chain below never fires.
+        function assertClickSucceeded(scrape) {
+          if (sa.type !== 'click') return
+          const result = parseClickResultFromScrape(scrape)
+          if (result && result.ok === false) {
+            throw new Error(`click ${sa.selector}: ${result.reason || 'failed'}`)
+          }
+        }
         try {
           const scrape = await fcScrape({ url: plan.url, actions: stepActions, formats, onlyMain: false })
           lastScrape = scrape
+          assertClickSucceeded(scrape)
           await applyRealCursorIfAny(scrape)
           const lastBurst = await streamShots(scrape, i)
           if (lastBurst) lastShot = lastBurst
@@ -1641,6 +1824,7 @@ ${trimmedHtml}`
             })
             const scrape = await fcScrape({ url: plan.url, actions: retry, formats, onlyMain: false })
             lastScrape = scrape
+            assertClickSucceeded(scrape)
             await applyRealCursorIfAny(scrape)
             const lastBurst = await streamShots(scrape, i)
             if (lastBurst) lastShot = lastBurst
@@ -1674,6 +1858,12 @@ ${trimmedHtml}`
                   })
                   const scrape3 = await fcScrape({ url: plan.url, actions: heal, formats, onlyMain: false })
                   lastScrape = scrape3
+                  // Check the repaired click too — if it also silently failed,
+                  // don't mark healed so the outer skip path kicks in.
+                  const healedResult = parseClickResultFromScrape(scrape3)
+                  if (sa.type === 'click' && healedResult && healedResult.ok === false) {
+                    throw new Error(`repaired click ${newSel}: ${healedResult.reason || 'failed'}`)
+                  }
                   const realHealed = await applyRealCursorIfAny(scrape3)
                   const lastBurst3 = await streamShots(scrape3, i)
                   if (lastBurst3) lastShot = lastBurst3
