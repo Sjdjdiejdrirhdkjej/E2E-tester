@@ -615,9 +615,87 @@ function evaluateExpectations(plan, scrape) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)) }
 
+// Build a JS snippet for Firecrawl's `executeJavascript` action that returns
+// the bounding rect of a selector + the viewport size. Handles plain CSS
+// selectors and Playwright text-engine selectors (text=Foo, text=/foo/i).
+// The result is read from `data.actions.javascriptReturns`.
+function selectorRectScript(selectorRaw) {
+  const sel = String(selectorRaw || '')
+  const j = JSON.stringify(sel)
+  return `(function(){
+try {
+  var sel = ${j};
+  function findText(s) {
+    var needle = s.slice(5).trim();
+    var regex = null;
+    var m = needle.match(/^\\/(.*)\\/([a-z]*)$/);
+    if (m) { try { regex = new RegExp(m[1], (m[2]||'').indexOf('i') >= 0 ? 'i' : ''); } catch (e) {} }
+    else {
+      if ((needle.charAt(0) === '"' && needle.charAt(needle.length-1) === '"') ||
+          (needle.charAt(0) === "'" && needle.charAt(needle.length-1) === "'")) {
+        needle = needle.slice(1, -1);
+      }
+    }
+    var tags = 'a,button,[role="button"],[role="link"],[role="tab"],[role="menuitem"],span,div,h1,h2,h3,h4,h5,li,label,option,p,input,textarea,summary,th,td';
+    var all = Array.from(document.querySelectorAll(tags));
+    function visible(el) {
+      var r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) return false;
+      var s = window.getComputedStyle(el);
+      if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity || '1') < 0.05) return false;
+      return true;
+    }
+    function match(t) { return regex ? regex.test(t) : (t === needle || t.toLowerCase() === needle.toLowerCase()); }
+    for (var i = 0; i < all.length; i++) { var t = (all[i].innerText || all[i].textContent || '').trim(); if (match(t) && visible(all[i])) return all[i]; }
+    if (!regex) {
+      var n = needle.toLowerCase();
+      for (var k = 0; k < all.length; k++) { var t2 = (all[k].innerText || all[k].textContent || '').trim().toLowerCase(); if (t2.indexOf(n) >= 0 && visible(all[k])) return all[k]; }
+    }
+    return null;
+  }
+  var el = null;
+  if (/^text=/i.test(sel)) { el = findText(sel); }
+  else { try { el = document.querySelector(sel); } catch (e) { el = null; } }
+  var vp = { w: window.innerWidth || document.documentElement.clientWidth, h: window.innerHeight || document.documentElement.clientHeight };
+  if (!el) { return { found: false, viewport: vp, selector: sel }; }
+  var r = el.getBoundingClientRect();
+  return { found: true, x: r.x, y: r.y, w: r.width, h: r.height, viewport: vp, selector: sel };
+} catch (e) { return { found: false, error: String(e && e.message || e) }; }
+})()`
+}
+
+// Pull the rect-probe return value out of a Firecrawl scrape response.
+// Firecrawl's response shape for executeJavascript can vary; try a few keys.
+function parseRectFromScrape(scrape) {
+  const list = scrape?.actions?.javascriptReturns || scrape?.actions?.javascript_returns || []
+  for (let k = list.length - 1; k >= 0; k--) {
+    const e = list[k]
+    const v = e?.return ?? e?.value ?? e?.result ?? (typeof e === 'object' && e?.viewport ? e : null)
+    if (v && typeof v === 'object' && v.viewport && typeof v.viewport.w === 'number' && typeof v.viewport.h === 'number') {
+      return v
+    }
+  }
+  return null
+}
+
+function rectToCursor(rect) {
+  if (!rect || !rect.found || !rect.viewport?.w || !rect.viewport?.h) return null
+  const cx = (rect.x + rect.w / 2) / rect.viewport.w
+  const cy = (rect.y + rect.h / 2) / rect.viewport.h
+  if (!Number.isFinite(cx) || !Number.isFinite(cy)) return null
+  // Clamp to [0.02, 0.98] so the cursor stays inside the visible stage.
+  return {
+    x: Math.max(0.02, Math.min(0.98, cx)),
+    y: Math.max(0.02, Math.min(0.98, cy)),
+  }
+}
+
 // Heuristic cursor position (normalized 0..1) for a given action.
-// We don't get real coords from Firecrawl, so we pick plausible zones
-// based on the selector / action type so the cursor moves believably.
+// Used as a fallback when we can't probe the real element rect from the page
+// (Firecrawl `executeJavascript` is the source of truth — see
+// `selectorRectScript` above). The heuristic still drives non-selector
+// actions (write/press/scroll) and the in-flight cursor before the rect
+// arrives.
 function estimateCursor(action, prev) {
   const sel = String(action?.selector || '').toLowerCase()
   const txt = String(action?.text || '').toLowerCase()
@@ -1158,10 +1236,29 @@ app.post('/api/run-agent', async (req, res) => {
       messages.push(assistantMsg)
 
       const label = shortLabel(turn.name, turn.args || {})
-      const cursor = estimateCursor(turn.name === 'click' ? { type: 'click', selector: turn.args?.selector } : { type: turn.name }, prev)
+      let cursor = estimateCursor(turn.name === 'click' ? { type: 'click', selector: turn.args?.selector } : { type: turn.name }, prev)
       prev = cursor
       send('thinking', { actionIndex: step, tool: turn.name, args: turn.args, label, rationale: turn.reasoning?.slice(0, 400) || '' })
       send('cursor', { actionIndex: step, x: cursor.x, y: cursor.y, label, busy: false })
+
+      // For selector-based actions, probe the real element rect so the AI
+      // cursor lands on the actual target instead of a heuristic zone.
+      if (turn.name === 'click' && turn.args?.selector && currentUrl) {
+        try {
+          const probe = await fcScrape(
+            currentUrl,
+            [...replay, { type: 'wait', milliseconds: 250 }, { type: 'executeJavascript', script: selectorRectScript(turn.args.selector) }],
+            ['html'],
+          )
+          const real = rectToCursor(parseRectFromScrape(probe))
+          if (real) {
+            cursor = real
+            prev = real
+            send('cursor', { actionIndex: step, x: real.x, y: real.y, label, busy: false })
+            await sleep(180)
+          }
+        } catch { /* keep heuristic cursor */ }
+      }
 
       // 4. Execute tool.
       if (turn.name === 'finish') {
@@ -1349,13 +1446,20 @@ ${trimmedHtml}`
     // Build a Firecrawl action list that captures several screenshots around
     // the real action so that, when the call returns, we can stream a burst
     // of frames to the client (closest thing to a live feed via /scrape).
+    // For selector-based actions (click / wait-for-selector), we also probe
+    // the target element's bounding rect via executeJavascript so the AI
+    // cursor can be moved to the actual element instead of a heuristic guess.
     function burstActions({ replayPrior, sa, beforeWait = 600, dwell = 200, postShots = 4 }) {
       const out = [
         ...replayPrior,
         { type: 'wait', milliseconds: beforeWait },
         { type: 'screenshot' },           // before
-        sa,
       ]
+      const probeSel = (sa.type === 'click' || (sa.type === 'wait' && sa.selector)) ? sa.selector : null
+      if (probeSel) {
+        out.push({ type: 'executeJavascript', script: selectorRectScript(probeSel) })
+      }
+      out.push(sa)
       for (let k = 0; k < postShots; k++) {
         out.push({ type: 'wait', milliseconds: dwell })
         out.push({ type: 'screenshot' })  // after, multiple times
@@ -1416,9 +1520,24 @@ ${trimmedHtml}`
         let ok = false
         // Tell the UI we're now waiting on Firecrawl to actually run this step.
         send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `${label} · executing…`, busy: true })
+        // Helper: when we got a real rect back, animate the cursor onto the
+        // actual element BEFORE streaming the post-action frames so the
+        // user sees the cursor land on the right place.
+        async function applyRealCursorIfAny(scrape) {
+          const rect = parseRectFromScrape(scrape)
+          const real = rectToCursor(rect)
+          if (real) {
+            prev = real
+            send('cursor', { actionIndex: i, action: a, x: real.x, y: real.y, label, busy: true })
+            await sleep(220)
+            return real
+          }
+          return null
+        }
         try {
           const scrape = await fcScrape({ url: plan.url, actions: stepActions, formats, onlyMain: false })
           lastScrape = scrape
+          await applyRealCursorIfAny(scrape)
           const lastBurst = await streamShots(scrape, i)
           if (lastBurst) lastShot = lastBurst
           ok = true
@@ -1434,6 +1553,7 @@ ${trimmedHtml}`
             })
             const scrape = await fcScrape({ url: plan.url, actions: retry, formats, onlyMain: false })
             lastScrape = scrape
+            await applyRealCursorIfAny(scrape)
             const lastBurst = await streamShots(scrape, i)
             if (lastBurst) lastShot = lastBurst
             ok = true
@@ -1466,12 +1586,15 @@ ${trimmedHtml}`
                   })
                   const scrape3 = await fcScrape({ url: plan.url, actions: heal, formats, onlyMain: false })
                   lastScrape = scrape3
+                  const realHealed = await applyRealCursorIfAny(scrape3)
                   const lastBurst3 = await streamShots(scrape3, i)
                   if (lastBurst3) lastShot = lastBurst3
                   // Replace the failed action in replay with the healed one.
                   replay[replay.length - 1] = fixed
                   healed = true
-                  send('cursor', { actionIndex: i, action: a, x: cursor.x, y: cursor.y, label: `${label} (repaired → ${newSel.slice(0, 40)})` })
+                  const cx = realHealed?.x ?? cursor.x
+                  const cy = realHealed?.y ?? cursor.y
+                  send('cursor', { actionIndex: i, action: a, x: cx, y: cy, label: `${label} (repaired → ${newSel.slice(0, 40)})` })
                 }
               } catch { /* fall through to skip */ }
             }

@@ -38,6 +38,15 @@ was empty on import, so this is a fresh scaffold.
 - `FIREWORKS_API_KEY`
 - `FIRECRAWL_API_KEY`
 
+## AI cursor positioning
+- Click / wait-for-selector steps include an `executeJavascript` probe that
+  returns `getBoundingClientRect()` of the target plus the page viewport
+  (`selectorRectScript` in `server/index.js`). The server reads the rect from
+  `actions.javascriptReturns`, normalizes to 0..1 via `rectToCursor`, and
+  emits a `cursor` event so the on-screen cursor lands on the actual element.
+- Falls back to the heuristic `estimateCursor` zones for non-selector actions
+  (write/press/scroll) and when the probe returns nothing.
+
 ## Deploy
 - Autoscale: build `npm run build`, run `npm run start`. The Express server
   serves the built SPA from `dist/` and the `/api` routes on port 5000.
