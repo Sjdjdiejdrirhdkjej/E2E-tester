@@ -118,11 +118,89 @@ img { max-width: 100%; }
   letter-spacing: 0.1em;
   color: var(--sidebar-muted);
 }
-.history { overflow: auto; flex: 1; padding: 0 8px 16px; -webkit-overflow-scrolling: touch; }
+.history { overflow: auto; padding: 0 8px 16px; -webkit-overflow-scrolling: touch; }
 .history-empty {
   padding: 10px 12px;
   color: var(--sidebar-muted);
   font-size: 12.5px;
+}
+
+/* ---------- Pull-to-refresh ---------- */
+.ptr {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.ptr-scroll {
+  height: 100%;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  will-change: transform;
+}
+.ptr-indicator {
+  position: absolute;
+  top: 0;
+  left: 50%;
+  width: 32px;
+  height: 32px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid var(--sidebar-line);
+  display: flex; align-items: center; justify-content: center;
+  pointer-events: none;
+  z-index: 2;
+  transition: opacity 160ms ease, background 160ms ease, border-color 160ms ease;
+}
+.ptr-indicator.ready { background: rgba(95,179,124,0.15); border-color: rgba(95,179,124,0.45); }
+.ptr-spinner {
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid var(--sidebar-muted);
+  border-top-color: var(--sidebar-ink);
+  display: inline-block;
+}
+.ptr-indicator.spinning .ptr-spinner {
+  animation: spin 0.85s linear infinite;
+}
+
+/* ---------- Swipeable row ---------- */
+.swipe-row {
+  position: relative;
+  overflow: hidden;
+  border-radius: 8px;
+  margin: 1px 0;
+  max-height: 80px;
+  transition: max-height 220ms ease, opacity 220ms ease, margin 220ms ease;
+}
+.swipe-row.committing { max-height: 0; opacity: 0; margin: 0; }
+.swipe-action {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: flex-end;
+  padding: 0 18px;
+  background: linear-gradient(to right, rgba(176,38,30,0.0) 0%, rgba(176,38,30,0.85) 35%, #b3261e 100%);
+  color: #fff;
+  font-size: 12.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  gap: 8px;
+  pointer-events: none;
+  z-index: 0;
+}
+.swipe-action-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.15);
+}
+.swipe-action-icon svg { width: 14px; height: 14px; }
+.swipe-action-label { font-weight: 600; }
+.swipe-front {
+  position: relative;
+  z-index: 1;
+  background: var(--sidebar-bg);
+  border-radius: 8px;
+  will-change: transform;
 }
 .history-item {
   display: flex; align-items: center; gap: 10px;

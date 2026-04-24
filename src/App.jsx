@@ -132,30 +132,32 @@ export default function App() {
 
   const selected = useMemo(() => tests.find((t) => t.id === selectedId) || null, [tests, selectedId])
 
-  useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      try {
-        const r = await fetch('/api/tasks')
-        if (!r.ok) return
-        const data = await r.json()
-        if (cancelled) return
-        if (Array.isArray(data?.tasks)) {
-          // Reset any non-terminal status from a prior session.
-          const cleaned = data.tasks.map((t) => {
-            if (t.status === 'running' || t.status === 'planning') {
-              return { ...t, status: 'fail', error: t.error || 'Interrupted (server restarted)' }
-            }
-            return t
-          })
-          setTests(cleaned)
-        }
-      } catch (err) {
-        console.warn('load tasks failed', err)
+  async function loadTasks() {
+    try {
+      const r = await fetch('/api/tasks')
+      if (!r.ok) return
+      const data = await r.json()
+      if (Array.isArray(data?.tasks)) {
+        // Reset any non-terminal status from a prior session.
+        const cleaned = data.tasks.map((t) => {
+          if (t.status === 'running' || t.status === 'planning') {
+            return { ...t, status: 'fail', error: t.error || 'Interrupted (server restarted)' }
+          }
+          return t
+        })
+        setTests((prev) => {
+          // Preserve any in-flight task in this session that the server doesn't know yet.
+          const serverIds = new Set(cleaned.map((t) => t.id))
+          const localOnly = prev.filter((t) => !serverIds.has(t.id) && (t.status === 'running' || t.status === 'planning' || t.status === 'clarifying'))
+          return [...localOnly, ...cleaned]
+        })
       }
-    })()
-    return () => { cancelled = true }
-  }, [])
+    } catch (err) {
+      console.warn('load tasks failed', err)
+    }
+  }
+
+  useEffect(() => { loadTasks() }, [])
 
   useEffect(() => {
     if (streamRef.current) streamRef.current.scrollTop = streamRef.current.scrollHeight
@@ -679,6 +681,7 @@ export default function App() {
         onSelect={setSelectedId}
         onNew={() => { newTask(); setNavOpen(false) }}
         onClose={() => setNavOpen(false)}
+        onRefresh={loadTasks}
         onDelete={(id) => {
           setTests((prev) => prev.filter((t) => t.id !== id))
           setSelectedId((cur) => (cur === id ? null : cur))
@@ -1068,7 +1071,7 @@ function shortUrl(u) {
   try { const x = new URL(u); return x.host + (x.pathname === '/' ? '' : x.pathname) } catch { return u }
 }
 
-function Sidebar({ tests, selectedId, onSelect, onNew, onClose, onDelete }) {
+function Sidebar({ tests, selectedId, onSelect, onNew, onClose, onDelete, onRefresh }) {
   return (
     <aside className="sidebar">
       <div className="sidebar-top">
@@ -1087,35 +1090,205 @@ function Sidebar({ tests, selectedId, onSelect, onNew, onClose, onDelete }) {
       </button>
 
       <div className="sidebar-section">History</div>
-      <div className="history">
+      <PullToRefresh className="history" onRefresh={onRefresh}>
         {tests.length === 0 ? (
           <div className="history-empty">No tests yet.</div>
         ) : (
           tests.map((t) => (
-            <div
+            <SwipeableRow
               key={t.id}
-              className={`history-item ${t.id === selectedId ? 'active' : ''}`}
-              onClick={() => onSelect(t.id)}
+              onDelete={() => onDelete?.(t.id)}
+              actionLabel="Delete"
             >
-              <span className={`dot ${t.status === 'planning' || t.status === 'clarifying' ? 'running' : t.status}`} />
-              <span className="name">{t.name}</span>
-              <span className="meta">{t.duration != null ? `${t.duration}ms` : ''}</span>
-              <button
-                className="history-delete"
-                aria-label="Delete task"
-                title="Delete task"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  onDelete?.(t.id)
-                }}
+              <div
+                className={`history-item ${t.id === selectedId ? 'active' : ''}`}
+                onClick={() => onSelect(t.id)}
               >
-                <Icon name="trash" />
-              </button>
-            </div>
+                <span className={`dot ${t.status === 'planning' || t.status === 'clarifying' ? 'running' : t.status}`} />
+                <span className="name">{t.name}</span>
+                <span className="meta">{t.duration != null ? `${t.duration}ms` : ''}</span>
+                <button
+                  className="history-delete"
+                  aria-label="Delete task"
+                  title="Delete task"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    onDelete?.(t.id)
+                  }}
+                >
+                  <Icon name="trash" />
+                </button>
+              </div>
+            </SwipeableRow>
           ))
         )}
-      </div>
+      </PullToRefresh>
     </aside>
+  )
+}
+
+function PullToRefresh({ onRefresh, className, children }) {
+  const scrollRef = useRef(null)
+  const startY = useRef(0)
+  const active = useRef(false)
+  const [pull, setPull] = useState(0)
+  const [refreshing, setRefreshing] = useState(false)
+  const threshold = 64
+  const max = 110
+
+  function isTouch() {
+    return typeof window !== 'undefined' && ('ontouchstart' in window || (navigator.maxTouchPoints || 0) > 0)
+  }
+
+  function onTouchStart(e) {
+    if (refreshing || !isTouch()) { active.current = false; return }
+    const el = scrollRef.current
+    if (!el || el.scrollTop > 0) { active.current = false; return }
+    startY.current = e.touches[0].clientY
+    active.current = true
+  }
+  function onTouchMove(e) {
+    if (!active.current || refreshing) return
+    const dy = e.touches[0].clientY - startY.current
+    if (dy <= 0) { setPull(0); return }
+    // Damped pull
+    const damped = Math.min(max, dy * 0.55)
+    setPull(damped)
+    if (damped > 6 && e.cancelable) e.preventDefault()
+  }
+  async function onTouchEnd() {
+    if (!active.current) return
+    active.current = false
+    if (pull >= threshold && onRefresh) {
+      setRefreshing(true)
+      try {
+        await Promise.race([
+          Promise.resolve(onRefresh()),
+          new Promise((res) => setTimeout(res, 4000)),
+        ])
+      } finally {
+        setRefreshing(false)
+        setPull(0)
+      }
+    } else {
+      setPull(0)
+    }
+  }
+
+  const offset = refreshing ? threshold : pull
+  const ready = pull >= threshold
+  return (
+    <div className="ptr">
+      <div
+        className={`ptr-indicator ${refreshing ? 'spinning' : ''} ${ready ? 'ready' : ''}`}
+        style={{
+          transform: `translate(-50%, ${Math.max(0, offset - 36)}px)`,
+          opacity: Math.min(1, (offset / threshold) * 1.2),
+        }}
+        aria-hidden="true"
+      >
+        <span
+          className="ptr-spinner"
+          style={refreshing ? null : { transform: `rotate(${(pull / threshold) * 320}deg)` }}
+        />
+      </div>
+      <div
+        ref={scrollRef}
+        className={`ptr-scroll ${className || ''}`}
+        style={{
+          transform: `translateY(${offset}px)`,
+          transition: active.current ? 'none' : 'transform 220ms ease',
+        }}
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+        onTouchCancel={onTouchEnd}
+      >
+        {children}
+      </div>
+    </div>
+  )
+}
+
+function SwipeableRow({ onDelete, actionLabel = 'Delete', children }) {
+  const [x, setX] = useState(0)
+  const [committing, setCommitting] = useState(false)
+  const startX = useRef(0)
+  const startY = useRef(0)
+  const dragging = useRef(false)
+  const decided = useRef(false)
+  const max = 88
+
+  function isTouch() {
+    return typeof window !== 'undefined' && ('ontouchstart' in window || (navigator.maxTouchPoints || 0) > 0)
+  }
+
+  function onTouchStart(e) {
+    if (!isTouch() || committing) return
+    startX.current = e.touches[0].clientX
+    startY.current = e.touches[0].clientY
+    dragging.current = false
+    decided.current = false
+  }
+  function onTouchMove(e) {
+    if (committing) return
+    const dx = e.touches[0].clientX - startX.current
+    const dy = e.touches[0].clientY - startY.current
+    if (!decided.current) {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return
+      decided.current = true
+      // If user moved more vertically, treat as scroll, never start drag.
+      dragging.current = Math.abs(dx) > Math.abs(dy)
+      if (!dragging.current) return
+    }
+    if (!dragging.current) return
+    if (e.cancelable) e.preventDefault()
+    let next = dx
+    // Elastic resistance past -max, and resistance when pulling right past 0
+    if (next < -max) next = -max - (Math.abs(next) - max) * 0.25
+    if (next > 0) next = next * 0.25
+    setX(next)
+  }
+  function onTouchEnd() {
+    if (!dragging.current) return
+    dragging.current = false
+    if (x < -max * 0.6) {
+      setCommitting(true)
+      setX(-window.innerWidth)
+      setTimeout(() => { onDelete?.() }, 200)
+    } else {
+      setX(0)
+    }
+  }
+
+  const revealed = x < 0
+  return (
+    <div className={`swipe-row ${committing ? 'committing' : ''}`}>
+      <div
+        className="swipe-action"
+        aria-hidden="true"
+        style={{
+          opacity: revealed ? 1 : 0,
+          transition: dragging.current ? 'none' : 'opacity 220ms ease',
+        }}
+      >
+        <span className="swipe-action-icon"><Icon name="trash" /></span>
+        <span className="swipe-action-label">{actionLabel}</span>
+      </div>
+      <div
+        className="swipe-front"
+        style={{
+          transform: `translateX(${x}px)`,
+          transition: dragging.current ? 'none' : 'transform 220ms ease',
+        }}
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+        onTouchCancel={onTouchEnd}
+      >
+        {children}
+      </div>
+    </div>
   )
 }
 
