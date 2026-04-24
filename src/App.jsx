@@ -1058,67 +1058,46 @@ export default function App() {
   )
 }
 
+function fmtArgs(tool, args) {
+  if (!args) return ''
+  switch (tool) {
+    case 'navigate':  return args.url || ''
+    case 'click':     return `[${args.index}]`
+    case 'type_text': return `"${String(args.text ?? '').slice(0, 80)}"`
+    case 'press':     return args.key || ''
+    case 'scroll':    return args.direction || ''
+    case 'wait':      return `${args.milliseconds}ms`
+    case 'finish':    return args.passed ? 'done · passed' : 'done · failed'
+    default:          return Object.entries(args).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ')
+  }
+}
+
 function LiveActivity({ entries }) {
-  const ref = useRef(null)
-  useEffect(() => {
-    if (ref.current) ref.current.scrollTop = ref.current.scrollHeight
-  }, [entries.length, entries[entries.length - 1]?.text?.length])
+  const list = entries || []
+  const last = [...list].reverse().find((e) => e.kind === 'tool_call') || null
+  const sys  = [...list].reverse().find((e) => e.kind === 'system')   || null
+
+  if (!last && !sys) return null
+
+  if (last) {
+    const args = fmtArgs(last.tool, last.args)
+    return (
+      <div className="live-tool">
+        <span className="live-tool-pulse" />
+        <span className="live-tool-name">{last.tool}</span>
+        {args && <span className="live-tool-sep">→</span>}
+        {args && <span className="live-tool-args">{args}</span>}
+        {typeof last.actionIndex === 'number' && last.actionIndex >= 0 && (
+          <span className="live-tool-step">step {last.actionIndex + 1}</span>
+        )}
+      </div>
+    )
+  }
+
   return (
-    <div className="activity-panel">
-      <div className="activity-head">
-        <span className="activity-pulse" />
-        Live activity · reasoning &amp; tool calls
-      </div>
-      <div className="activity-body" ref={ref}>
-        {entries.map((e, i) => {
-          if (e.kind === 'tool_call') {
-            return (
-              <div className="activity-item tool" key={i}>
-                <div className="activity-row">
-                  <span className="activity-tag">tool</span>
-                  <span className="activity-tool">{e.tool}</span>
-                  {typeof e.actionIndex === 'number' && e.actionIndex >= 0 && (
-                    <span className="activity-step">step {e.actionIndex + 1}</span>
-                  )}
-                </div>
-                <div className="activity-label">{e.label}</div>
-                <pre className="activity-args">{JSON.stringify(e.args, null, 2)}</pre>
-              </div>
-            )
-          }
-          if (e.kind === 'reasoning') {
-            return (
-              <div className="activity-item reasoning" key={i}>
-                <div className="activity-row">
-                  <span className="activity-tag reason">reasoning</span>
-                </div>
-                <div className="activity-text">
-                  {e.text}
-                  {e.streaming && <span className="type-caret" />}
-                </div>
-              </div>
-            )
-          }
-          if (e.kind === 'plan_json') {
-            return (
-              <div className="activity-item plan" key={i}>
-                <div className="activity-row">
-                  <span className="activity-tag plan">plan json</span>
-                </div>
-                <pre className="activity-args">{e.text}{e.streaming && <span className="type-caret" />}</pre>
-              </div>
-            )
-          }
-          return (
-            <div className="activity-item sys" key={i}>
-              <div className="activity-row">
-                <span className="activity-tag sys">·</span>
-                <span className="activity-text">{e.text}</span>
-              </div>
-            </div>
-          )
-        })}
-      </div>
+    <div className="live-tool sys">
+      <span className="live-tool-pulse" />
+      <span className="live-tool-args">{sys.text}</span>
     </div>
   )
 }
