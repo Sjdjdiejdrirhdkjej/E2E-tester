@@ -1017,18 +1017,23 @@ export default function App() {
               <h1 className="hello">Hello, <span className="accent">{appMode === 'browser-use' ? 'what shall we automate today?' : 'what shall we test today?'}</span></h1>
               <p className="subhello">{appMode === 'browser-use' ? 'Describe any browser task and the agent will complete it.' : 'Just describe it, and consider it done.'}</p>
               <div className="examples">
-                {[
+                {(appMode === 'browser-use' ? [
+                  'Go to wikipedia.org, search for "Alan Turing", and return his birth year',
+                  'On news.ycombinator.com, find the title and score of the #1 story',
+                  'Open quotes.toscrape.com and collect the first 3 quotes on the page',
+                  'Search DuckDuckGo for "OpenAI" and open the first non-ad result',
+                ] : [
                   'Open duckduckgo.com, search for "Replit Agent", verify a result mentions Replit',
                   'Go to news.ycombinator.com and verify the top story title is non-empty',
                   'On example.com, click "More information…" and confirm the URL changes to iana.org',
                   'Sign up on demoqa.com/automation-practice-form with placeholder data and submit',
-                ].map((ex) => (
+                ]).map((ex) => (
                   <button
                     key={ex}
                     className="example-chip"
                     onClick={() => !busy && planAndRun(ex)}
                     disabled={busy}
-                    title="Try this scenario"
+                    title={appMode === 'browser-use' ? 'Try this task' : 'Try this scenario'}
                   >
                     {ex}
                   </button>
