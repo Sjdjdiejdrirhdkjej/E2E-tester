@@ -705,7 +705,7 @@ export default function App() {
             )}
             {busy && (
               <>
-                <span className="btn ghost" style={{ cursor: 'default' }}>
+                <span className="btn ghost working-pill" style={{ cursor: 'default' }}>
                   <span className="dot running" style={{ display: 'inline-block', marginRight: 6 }} />
                   Working…
                 </span>
@@ -735,6 +735,20 @@ export default function App() {
                   </a>
                 )}
               </div>
+
+              <details className="run-scenario-mobile">
+                <summary>Scenario details</summary>
+                <div className="scenario-body">
+                  <div className="kv">
+                    <div className="k">Status</div><div className="v">{selected.status}</div>
+                    <div className="k">Start URL</div><div className="v">{selected.url || '—'}</div>
+                    <div className="k">Final URL</div><div className="v">{selected.finalUrl || '—'}</div>
+                    <div className="k">Title</div><div className="v">{selected.title || '—'}</div>
+                    <div className="k">Actions</div><div className="v">{selected.actions?.length || 0}</div>
+                    <div className="k">Duration</div><div className="v">{selected.duration != null ? `${selected.duration} ms` : '—'}</div>
+                  </div>
+                </div>
+              </details>
 
               {selected.status === 'clarifying' && (
                 <div className="bubble clarify">

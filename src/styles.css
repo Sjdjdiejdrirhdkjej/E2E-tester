@@ -30,6 +30,7 @@
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; }
+html { -webkit-text-size-adjust: 100%; }
 body {
   margin: 0;
   font: 14px/1.55 var(--sans);
@@ -38,8 +39,12 @@ body {
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 button { font-family: inherit; }
+input, textarea, select { font-family: inherit; }
+img { max-width: 100%; }
 
 .app {
   display: grid;
@@ -497,6 +502,9 @@ button { font-family: inherit; }
   display: none;
 }
 
+/* Mobile-only inline scenario summary (hidden on desktop) */
+.run-scenario-mobile { display: none; }
+
 /* ---------- Tablet ---------- */
 @media (max-width: 1024px) {
   :root { --sidebar-w: 220px; --aside-w: 300px; }
@@ -504,6 +512,8 @@ button { font-family: inherit; }
 
 /* ---------- Mobile ---------- */
 @media (max-width: 760px) {
+  :root { --aside-w: 0px; }
+
   .app { grid-template-columns: 1fr; }
 
   .sidebar {
@@ -514,32 +524,142 @@ button { font-family: inherit; }
     transform: translateX(-100%);
     transition: transform 220ms ease;
     border-right: 1px solid var(--sidebar-line);
+    padding-top: env(safe-area-inset-top, 0);
+    padding-bottom: env(safe-area-inset-bottom, 0);
   }
   .app.nav-open .sidebar { transform: translateX(0); }
   .app.nav-open .nav-scrim { display: block; }
 
+  /* Bigger tap targets in the drawer */
+  .history-item { padding: 12px 10px; }
+  .history-item .name { font-size: 15px; }
+  .new-task { padding: 13px 12px; font-size: 15px; }
+
   .close-btn { display: inline-flex; }
   .menu-btn { display: inline-flex; }
 
-  .topbar { padding: 8px 10px; }
+  /* Top bar with safe area + compact actions */
+  .topbar {
+    padding: 8px 10px;
+    padding-top: calc(env(safe-area-inset-top, 0) + 8px);
+  }
   .crumb { font-size: 14px; }
-  .btn { padding: 8px 12px; }
+  .top-actions { gap: 6px; }
+  .top-actions .btn { padding: 7px 10px; font-size: 12.5px; }
+  .top-actions .btn.ghost.working-pill { display: none; }
 
   .run { grid-template-columns: 1fr; }
   .run-aside { display: none; }
-  .run-stream { padding: 16px 16px 160px; }
-  .dock { right: 0; padding: 12px 12px calc(env(safe-area-inset-bottom, 0) + 12px); }
+  .run-stream { padding: 14px 14px 180px; }
+  .dock {
+    right: 0;
+    padding: 10px 10px calc(env(safe-area-inset-bottom, 0) + 10px);
+    background: linear-gradient(to top, var(--bg) 70%, rgba(246,241,231,0));
+  }
+  .dock .prompt { width: 100%; }
 
-  .hero { padding: 28px 16px 60px; }
+  .hero { padding: 24px 14px 40px; }
+  .examples { gap: 6px; }
+  .example-chip {
+    width: 100%;
+    text-align: center;
+    font-size: 13px;
+    padding: 10px 12px;
+  }
 
   .bubble { padding: 12px 14px; border-radius: 12px; }
+  .summary-pills { gap: 6px; margin-bottom: 12px; }
+  .pill { font-size: 11.5px; padding: 4px 9px; }
 
-  .kv { grid-template-columns: 80px 1fr; }
+  .kv { grid-template-columns: 90px 1fr; gap: 4px 10px; font-size: 13px; }
+
+  /* Inline mobile scenario summary */
+  .run-scenario-mobile {
+    display: block;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 0;
+    margin-bottom: 12px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .run-scenario-mobile > summary {
+    list-style: none;
+    cursor: pointer;
+    padding: 12px 14px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    display: flex; align-items: center; gap: 8px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .run-scenario-mobile > summary::-webkit-details-marker { display: none; }
+  .run-scenario-mobile > summary::after {
+    content: "";
+    margin-left: auto;
+    width: 8px; height: 8px;
+    border-right: 1.6px solid var(--muted);
+    border-bottom: 1.6px solid var(--muted);
+    transform: rotate(45deg);
+    transition: transform 180ms ease;
+  }
+  .run-scenario-mobile[open] > summary::after { transform: rotate(-135deg); }
+  .run-scenario-mobile .scenario-body { padding: 0 14px 14px; }
+
+  /* Activity panel: shorter so the prompt isn't off-screen */
+  .activity-body { max-height: 220px; padding: 10px 12px; }
+  .activity-args { max-height: 120px; font-size: 11px; }
+
+  /* Live stage: a touch shorter on mobile, allow horizontal pan */
+  .stage-frame { aspect-ratio: 4 / 3; }
+  .stage-img { object-fit: contain; }
+  .stage-bar { padding: 7px 10px; }
+  .stage-label { font-size: 11.5px; }
+
+  /* Prompt: compact chip row, ensure 16px input to avoid iOS zoom */
+  .prompt { padding: 8px 8px 6px; border-radius: 16px; }
+  .prompt textarea { font-size: 16px; min-height: 44px; padding: 8px 6px 4px; }
+  .prompt-row { padding: 4px 2px 0; }
+  .chip { padding: 5px 9px; font-size: 12px; }
+  .send { width: 44px; height: 44px; }
+
+  /* Clarify */
+  .clarify-ta { min-height: 120px; font-size: 16px; }
+  .clarify-go { width: 100%; padding: 12px 14px; font-size: 15px; }
+
+  /* Steps row: stack on small screens */
+  .step { padding: 10px 12px; font-size: 12px; flex-wrap: wrap; }
+  .step .label { word-break: break-word; }
 }
 
-@media (max-width: 380px) {
-  .chip { font-size: 12px; padding: 4px 8px; }
-  .send { width: 36px; height: 36px; }
+/* ---------- Small phones ---------- */
+@media (max-width: 420px) {
+  .topbar { padding: 8px 8px; padding-top: calc(env(safe-area-inset-top, 0) + 8px); }
+  .crumb { font-size: 13px; }
+  .top-actions .btn { padding: 6px 9px; font-size: 12px; }
+
+  .run-stream { padding: 12px 12px 180px; }
+  .hero { padding: 20px 12px 32px; }
+  .hello { font-size: clamp(26px, 8vw, 34px); }
+
+  .chip { font-size: 11.5px; padding: 4px 8px; gap: 4px; }
+  .chip svg { width: 12px; height: 12px; }
+
+  .kv { grid-template-columns: 80px 1fr; font-size: 12.5px; }
+  .pill { font-size: 11px; padding: 3px 8px; }
+
+  .activity-body { max-height: 180px; }
+}
+
+/* ---------- Landscape on short phones ---------- */
+@media (max-width: 900px) and (orientation: landscape) and (max-height: 500px) {
+  .hero { padding: 16px 14px 24px; }
+  .hello { font-size: 24px; }
+  .subhello { margin-bottom: 12px; }
+  .stage-frame { aspect-ratio: 16 / 9; }
+  .activity-body { max-height: 140px; }
 }
 
 /* ---------- Live stage (browser stream + AI cursor) ---------- */
