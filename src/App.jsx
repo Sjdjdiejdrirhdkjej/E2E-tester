@@ -1253,6 +1253,11 @@ function Sidebar({ tests, selectedId, onSelect, onNew, onClose, onDelete, onRefr
               >
                 <span className={`dot ${t.status === 'planning' || t.status === 'clarifying' ? 'running' : t.status}`} />
                 <span className="name">{t.name}</span>
+                {t.mode && (
+                  <span className={`mode-badge ${t.mode === 'browser-use' ? 'mode-bu' : 'mode-e2e'}`}>
+                    {t.mode === 'browser-use' ? 'bu' : 'e2e'}
+                  </span>
+                )}
                 <span className="meta">{t.duration != null ? `${t.duration}ms` : ''}</span>
                 <button
                   className="history-delete"
