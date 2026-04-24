@@ -193,6 +193,23 @@ async function getRunStatus(taskId) {
   } catch { return null }
 }
 
+function getStoredTheme() {
+  try {
+    const stored = localStorage.getItem('theme')
+    if (stored === 'light' || stored === 'dark') return stored
+  } catch {}
+  return null
+}
+
+function getSystemTheme() {
+  if (typeof window === 'undefined') return 'light'
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+}
+
+function getInitialTheme() {
+  return getStoredTheme() || getSystemTheme()
+}
+
 export default function App() {
   const [tests, setTests] = useState([])
   const [selectedId, setSelectedId] = useState(null)
@@ -200,6 +217,32 @@ export default function App() {
   const [draft, setDraft] = useState('')
   const [planMode, setPlanMode] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
+  const [theme, setTheme] = useState(getInitialTheme)
+
+  useEffect(() => {
+    // Apply theme to <html> so CSS vars cascade everywhere.
+    document.documentElement.setAttribute('data-theme', theme)
+  }, [theme])
+
+  useEffect(() => {
+    // Follow OS preference until the user explicitly picks via toggle.
+    if (typeof window === 'undefined' || !window.matchMedia) return
+    const mq = window.matchMedia('(prefers-color-scheme: dark)')
+    const onChange = (e) => {
+      if (getStoredTheme()) return // user preference wins
+      setTheme(e.matches ? 'dark' : 'light')
+    }
+    mq.addEventListener?.('change', onChange)
+    return () => mq.removeEventListener?.('change', onChange)
+  }, [])
+
+  function toggleTheme() {
+    setTheme((t) => {
+      const next = t === 'dark' ? 'light' : 'dark'
+      try { localStorage.setItem('theme', next) } catch {}
+      return next
+    })
+  }
   const streamRef = useRef(null)
   // Map<taskId, { close, done }> — active background-run subscriptions. Keyed
   // by the task id so multiple runs can be observed in parallel and switching
@@ -767,6 +810,14 @@ export default function App() {
             {selected ? <b>{selected.name}</b> : <>E2E Tester</>}
           </div>
           <div className="top-actions">
+            <button
+              className="icon-btn ink theme-btn"
+              onClick={toggleTheme}
+              aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+              title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            >
+              <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
+            </button>
             {selected && !busy && selected.status !== 'planning' && selected.status !== 'running' && selected.status !== 'clarifying' && (
               <>
                 {selected.status === 'fail' && (selected.finalUrl || selected.url) && (
@@ -1419,6 +1470,8 @@ function Icon({ name }) {
     case 'globe':      return <svg viewBox="0 0 24 24" {...common}><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14 0 18M12 3c-3 3.5-3 14 0 18"/></svg>
     case 'bolt':       return <svg viewBox="0 0 24 24" {...common}><path d="M13 3 4 14h7l-1 7 9-11h-7l1-7Z"/></svg>
     case 'trash':      return <svg viewBox="0 0 24 24" {...common}><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
+    case 'moon':       return <svg viewBox="0 0 24 24" {...common}><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+    case 'sun':        return <svg viewBox="0 0 24 24" {...common}><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
     default:           return null
   }
 }
