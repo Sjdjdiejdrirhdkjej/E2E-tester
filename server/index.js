@@ -749,6 +749,121 @@ function __findElement(sel) {
 }
 `
 
+// ===== browser-use style: numbered interactive-element index =====
+//
+// Before each agent turn we inject this script into the page via Firecrawl's
+// `executeJavascript` action. It walks the visible DOM and assigns a 1-based
+// index to every interactive element, mirroring the way browser-use annotates
+// its DOM snapshot so the AI can say `click({ index: 3 })` instead of having
+// to invent a CSS selector.
+//
+// Return shape: { elements: [{ index, tag, role, text, type, placeholder,
+//   ariaLabel, href, selector, cx, cy }] }
+//
+// `selector` is the best stable selector we can build for each element so the
+// server can pass it to `browserUseClickScript` when executing the click.
+function buildElementIndexScript() {
+  return `(function(){
+try {
+  function __vis(el) {
+    var r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return false;
+    var s = window.getComputedStyle(el);
+    if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity||'1') < 0.05) return false;
+    if (r.bottom < 0 || r.top > window.innerHeight + 400) return false;
+    return true;
+  }
+  function __text(el) {
+    var t = (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim();
+    return t.slice(0, 80);
+  }
+  function __label(el) {
+    var al = el.getAttribute('aria-label');
+    if (al) return al.trim().slice(0,80);
+    var lid = el.getAttribute('aria-labelledby');
+    if (lid) { var le = document.getElementById(lid); if (le) return (le.innerText||le.textContent||'').trim().slice(0,80); }
+    var lbl = document.querySelector('label[for="'+el.id+'"]');
+    if (lbl) return (lbl.innerText||lbl.textContent||'').trim().slice(0,80);
+    return '';
+  }
+  // Build the most stable selector we can for an element.
+  function __sel(el) {
+    var tag = el.tagName.toLowerCase();
+    if (el.id) { try { document.querySelector('#'+CSS.escape(el.id)); return '#'+CSS.escape(el.id); } catch(e) {} }
+    var name = el.getAttribute('name');
+    if (name) { var ns = tag+'[name='+JSON.stringify(name)+']'; try { if(document.querySelector(ns)) return ns; } catch(e){} }
+    var al = el.getAttribute('aria-label');
+    if (al) return '[aria-label='+JSON.stringify(al)+']';
+    var ph = el.getAttribute('placeholder');
+    if (ph) return '[placeholder='+JSON.stringify(ph)+']';
+    var txt = __text(el);
+    if (txt && txt.length >= 2 && txt.length <= 60) return 'text='+txt;
+    var type = el.getAttribute('type');
+    if (type) return tag+'[type='+JSON.stringify(type)+']';
+    return tag;
+  }
+  var INTERACTIVE = 'a[href],button,input:not([type=hidden]),select,textarea,details,summary,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="tab"],[role="menuitem"],[role="combobox"],[role="option"],[role="switch"],[tabindex]';
+  var all = Array.from(document.querySelectorAll(INTERACTIVE));
+  var seen = new Set();
+  var elements = [];
+  for (var i = 0; i < all.length; i++) {
+    var el = all[i];
+    if (!__vis(el)) continue;
+    if (seen.has(el)) continue;
+    seen.add(el);
+    var tag = el.tagName.toLowerCase();
+    var role = el.getAttribute('role') || tag;
+    var text = __text(el) || __label(el) || el.getAttribute('placeholder') || el.getAttribute('value') || '';
+    var rect = el.getBoundingClientRect();
+    elements.push({
+      index: elements.length + 1,
+      tag: tag,
+      role: role,
+      type: el.getAttribute('type') || '',
+      text: text,
+      placeholder: el.getAttribute('placeholder') || '',
+      ariaLabel: el.getAttribute('aria-label') || '',
+      href: (tag === 'a' && el.href) ? String(el.href).slice(0, 120) : '',
+      selector: __sel(el),
+      cx: Math.round(rect.left + rect.width / 2),
+      cy: Math.round(rect.top + rect.height / 2),
+      disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
+    });
+    if (elements.length >= 80) break; // cap to keep payload small
+  }
+  return { elements: elements };
+} catch(e) { return { elements: [], error: String(e&&e.message||e) }; }
+})()`
+}
+
+// Format an element list for the AI's observation message, mirroring
+// browser-use's text-state format: each line is "[index] role|tag "text" extra".
+function formatElementsForAI(elements) {
+  if (!Array.isArray(elements) || !elements.length) return '(no interactive elements detected)'
+  const lines = elements.map((el) => {
+    const kind = el.role !== el.tag ? el.role : (el.type ? `${el.tag}[${el.type}]` : el.tag)
+    const label = el.text || el.ariaLabel || el.placeholder || ''
+    const extra = el.href ? ` → ${el.href.slice(0, 60)}` : el.placeholder ? ` placeholder="${el.placeholder}"` : ''
+    const dis = el.disabled ? ' [disabled]' : ''
+    return `[${el.index}] ${kind} "${label.slice(0,60)}"${extra}${dis}`
+  })
+  return lines.join('\n')
+}
+
+// Parse the element-index payload from a Firecrawl scrape response.
+// Returns an array of element descriptors (or [] if not found).
+function parseElementsFromScrape(scrape) {
+  const list = scrape?.actions?.javascriptReturns || scrape?.actions?.javascript_returns || []
+  for (let k = list.length - 1; k >= 0; k--) {
+    const e = list[k]
+    const v = e?.return ?? e?.value ?? e?.result ?? (typeof e === 'object' ? e : null)
+    if (v && typeof v === 'object' && Array.isArray(v.elements)) {
+      return v.elements
+    }
+  }
+  return []
+}
+
 // Build a JS snippet for Firecrawl's `executeJavascript` action that returns
 // the bounding rect of a selector + the viewport size. Handles plain CSS
 // selectors and Playwright text-engine selectors (text=Foo, text=/foo/i).
@@ -1118,39 +1233,59 @@ async function summarizeRun({ plan, finalUrl, title, expectations, passed, durat
 // ----- Agentic loop: model observes the page after every action and decides
 // the next single tool call. Streams reasoning + tool calls + frames live. -----
 
-const AGENT_SYSTEM = `You are an autonomous browser-testing agent. Each turn you receive the user's overall goal and a fresh observation of the current page (URL, title, a snippet of the rendered text/HTML, and recent action history). You also implicitly see the page screenshot the user is viewing.
+const AGENT_SYSTEM = `You are an autonomous browser-testing agent. Each turn you receive:
+1. The user's overall goal.
+2. A screenshot of the current page (look at it carefully).
+3. A numbered list of every interactive element the browser can currently see — this is your element index.
+4. The current URL, page title, and a snippet of the page HTML.
 
-You MUST respond by calling exactly ONE tool per turn. Do not write any prose; the tool call IS your action. Do not pre-plan multiple actions — just pick the single best next step based on what the page currently shows.
+You MUST respond by calling exactly ONE tool per turn. Do not write any prose; the tool call IS your action.
 
 Tools available:
 - navigate({ url }): go to a fully-qualified https URL (use this for the very first step if no page is loaded).
-- click({ selector }): click an element. Strongly prefer Playwright text selectors like "text=Sign in", "text=/^Search/i", or attribute selectors like "input[name='q']", "[aria-label='Search']", "[placeholder*='Search']". NEVER invent class names you cannot see in the HTML.
-- type_text({ text }): type text into the field that was most recently clicked/focused. There is NO selector — click the input first, then type.
+- click({ index }): click an element by its NUMBER from the element index list below the screenshot. Always use the index — never guess a CSS selector. Example: click({ index: 3 }) clicks element [3].
+- type_text({ text }): type text into the field that was most recently clicked/focused. There is NO index — click the input first, then type.
 - press({ key }): press a key (usually "Enter" to submit a form).
-- scroll({ direction }): "up" or "down".
+- scroll({ direction }): "up" or "down". Use this to reveal more elements if the one you need is not visible.
 - wait({ milliseconds }): wait briefly for the page to settle (200-2000 ms).
 - finish({ passed, reason, evidence }): end the test. Set passed=true if the goal was met, false otherwise. reason is a short human explanation; evidence is a quoted snippet from the observed page text that supports the verdict.
 
 Rules:
 - Always call exactly one tool per turn — never zero, never multiple.
-- After typing, follow with press("Enter") or click the submit button.
-- If a previous click failed (the observation shows the page didn't change), try a different selector based on what's actually in the HTML.
-- Do not reuse credentials; placeholders only.
-- Stop with finish() as soon as you have evidence the goal succeeded or definitively failed.`
+- ALWAYS use click({ index: N }) — never make up CSS selectors.
+- If an element you need is not in the list, scroll() to reveal more, then observe again.
+- After typing, follow with press("Enter") or click the submit button index.
+- Do not reuse real credentials; use placeholders like demo@example.com.
+- Stop with finish() as soon as you have clear evidence the goal succeeded or definitively failed.`
 
 const AGENT_TOOLS = [
   { type: 'function', function: { name: 'navigate', description: 'Open a URL', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
-  { type: 'function', function: { name: 'click', description: 'Click an element by selector', parameters: { type: 'object', properties: { selector: { type: 'string' } }, required: ['selector'] } } },
-  { type: 'function', function: { name: 'type_text', description: 'Type into the focused field', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } } },
+  { type: 'function', function: { name: 'click', description: 'Click an element by its index number from the element list. Always use index, never a CSS selector.', parameters: { type: 'object', properties: { index: { type: 'integer', description: 'The element index number shown in [brackets] in the element list' } }, required: ['index'] } } },
+  { type: 'function', function: { name: 'type_text', description: 'Type into the focused field (click the field first)', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } } },
   { type: 'function', function: { name: 'press', description: 'Press a key', parameters: { type: 'object', properties: { key: { type: 'string' } }, required: ['key'] } } },
-  { type: 'function', function: { name: 'scroll', description: 'Scroll the page', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] } }, required: ['direction'] } } },
-  { type: 'function', function: { name: 'wait', description: 'Wait briefly', parameters: { type: 'object', properties: { milliseconds: { type: 'number' } }, required: ['milliseconds'] } } },
+  { type: 'function', function: { name: 'scroll', description: 'Scroll the page to reveal more elements', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] } }, required: ['direction'] } } },
+  { type: 'function', function: { name: 'wait', description: 'Wait briefly for the page to settle', parameters: { type: 'object', properties: { milliseconds: { type: 'number' } }, required: ['milliseconds'] } } },
   { type: 'function', function: { name: 'finish', description: 'End the test', parameters: { type: 'object', properties: { passed: { type: 'boolean' }, reason: { type: 'string' }, evidence: { type: 'string' } }, required: ['passed', 'reason'] } } },
 ]
 
-function agentToolToFirecrawl(name, args) {
+// Resolve a click-by-index tool call into a Firecrawl action.
+// `currentElements` is the element list from the most recent page observation.
+function resolveClickIndex(index, currentElements) {
+  const el = Array.isArray(currentElements)
+    ? currentElements.find((e) => e.index === index)
+    : null
+  const selector = el?.selector || null
+  return { selector, element: el || null }
+}
+
+function agentToolToFirecrawl(name, args, currentElements) {
   switch (name) {
-    case 'click':     return { type: 'click', selector: String(args.selector || '') }
+    case 'click': {
+      const idx = Number(args.index)
+      const { selector } = resolveClickIndex(idx, currentElements)
+      if (!selector) return null
+      return { type: 'click', selector }
+    }
     case 'type_text': return { type: 'write', text: String(args.text ?? '') }
     case 'press':     return { type: 'press', key: String(args.key || 'Enter') }
     case 'scroll':    return { type: 'scroll', direction: args.direction === 'up' ? 'up' : 'down' }
@@ -1159,10 +1294,15 @@ function agentToolToFirecrawl(name, args) {
   }
 }
 
-function shortLabel(name, args) {
+function shortLabel(name, args, currentElements) {
   switch (name) {
     case 'navigate':  return `navigate to ${args.url}`
-    case 'click':     return `click ${args.selector}`
+    case 'click': {
+      const idx = Number(args.index)
+      const el = Array.isArray(currentElements) ? currentElements.find((e) => e.index === idx) : null
+      const desc = el ? `[${idx}] ${el.text || el.role || el.tag}`.slice(0, 50) : `[${idx}]`
+      return `click ${desc}`
+    }
     case 'type_text': return `type "${String(args.text || '').slice(0, 60)}"`
     case 'press':     return `press ${args.key}`
     case 'scroll':    return `scroll ${args.direction}`
@@ -1389,6 +1529,7 @@ app.post('/api/run-agent', async (req, res) => {
     let lastShot = null
     let lastScrape = null
     let lastObservation = { url: currentUrl || '', title: '', text: '' }
+    let currentElements = []   // numbered element list from the most recent observation
     let aborted = ac.signal.aborted
     ac.signal.addEventListener('abort', () => { aborted = true })
     const messages = [
@@ -1407,37 +1548,51 @@ app.post('/api/run-agent', async (req, res) => {
       if (currentUrl) {
         send('cursor', { actionIndex: step, x: prev.x, y: prev.y, label: `observing ${currentUrl}`, busy: true })
         try {
-          const acts = [...replay, { type: 'wait', milliseconds: 400 }, { type: 'screenshot' }]
+          // Include the element-index extraction script so we get the numbered
+          // element list in the same Firecrawl call as the screenshot.
+          const acts = [
+            ...replay,
+            { type: 'wait', milliseconds: 400 },
+            { type: 'screenshot' },
+            { type: 'executeJavascript', script: buildElementIndexScript() },
+          ]
           lastScrape = await fcScrape(currentUrl, acts, ['screenshot', 'html', 'markdown'])
           const shot = (lastScrape?.actions?.screenshots || [])[ (lastScrape?.actions?.screenshots || []).length - 1 ] || lastScrape?.screenshot
           if (shot) {
             lastShot = shot
             send('frame', { image: shot, actionIndex: step })
-            // Convert to data URL so the vision model can ingest it directly.
             screenshotDataUrl = await fetchAsDataUrl(shot, ac.signal)
           }
+          // Extract the numbered element list from the executeJavascript return.
+          currentElements = parseElementsFromScrape(lastScrape)
           observation = {
             url: lastScrape?.metadata?.sourceURL || currentUrl,
             title: lastScrape?.metadata?.title || '',
             text: htmlToObservation(lastScrape?.html || lastScrape?.markdown || ''),
+            elements: currentElements,
           }
           lastObservation = observation
-          send('observation', { step, url: observation.url, title: observation.title })
+          send('observation', { step, url: observation.url, title: observation.title, elementCount: currentElements.length })
         } catch (err) {
-          observation = { url: currentUrl, title: '', text: '', error: String(err.message || err) }
+          observation = { url: currentUrl, title: '', text: '', elements: [], error: String(err.message || err) }
           lastObservation = observation
           send('observation', { step, url: currentUrl, title: '', error: observation.error })
         }
       } else {
-        observation = { url: '(no page yet)', title: '', text: '' }
+        observation = { url: '(no page yet)', title: '', text: '', elements: [] }
         lastObservation = observation
       }
       if (aborted) break
 
       // 2. Build user observation message — multimodal when we have a screenshot.
+      // Include the numbered element index so the AI can click by number.
+      const elementIndexText = formatElementsForAI(observation.elements || currentElements)
       const obsText = observation.error
         ? `Step ${step + 1}. Page load failed: ${observation.error}\nDecide the next single tool call.`
-        : `Step ${step + 1}.\nCurrent URL: ${observation.url}\nPage title: ${observation.title}\n\nLook at the screenshot above AND the HTML below to decide your next action. The screenshot shows the visual state; the HTML is for picking accurate selectors.\n\nVisible page HTML (truncated):\n${observation.text}\n\nCall exactly one tool for your next action.`
+        : `Step ${step + 1}.\nCurrent URL: ${observation.url}\nPage title: ${observation.title}\n\n` +
+          `Interactive elements on this page (use these index numbers to click):\n${elementIndexText}\n\n` +
+          `Visible page HTML (truncated — for context only, use element index numbers above to click):\n${observation.text}\n\n` +
+          `Call exactly one tool. To click something, use click({ index: N }) with the number from the list above.`
       const userContent = screenshotDataUrl
         ? [
             { type: 'image_url', image_url: { url: screenshotDataUrl } },
@@ -1499,29 +1654,47 @@ app.post('/api/run-agent', async (req, res) => {
       if (turn.reasoning) assistantMsg.reasoning_content = turn.reasoning
       messages.push(assistantMsg)
 
-      const label = shortLabel(turn.name, turn.args || {})
-      let cursor = estimateCursor(turn.name === 'click' ? { type: 'click', selector: turn.args?.selector } : { type: turn.name }, prev)
+      const label = shortLabel(turn.name, turn.args || {}, currentElements)
+      // For click-by-index, use the element's actual coordinates if available.
+      let cursor
+      if (turn.name === 'click' && turn.args?.index != null) {
+        const el = currentElements.find((e) => e.index === Number(turn.args.index))
+        if (el && el.cx != null && el.cy != null) {
+          const vw = 1280; const vh = 800 // Firecrawl default viewport
+          cursor = {
+            x: Math.max(0.02, Math.min(0.98, el.cx / vw)),
+            y: Math.max(0.02, Math.min(0.98, el.cy / vh)),
+          }
+        }
+      }
+      if (!cursor) {
+        cursor = estimateCursor(turn.name === 'click' ? { type: 'click', selector: '' } : { type: turn.name }, prev)
+      }
       prev = cursor
       send('thinking', { actionIndex: step, tool: turn.name, args: turn.args, label, rationale: turn.reasoning?.slice(0, 400) || '' })
       send('cursor', { actionIndex: step, x: cursor.x, y: cursor.y, label, busy: false })
 
-      // For selector-based actions, probe the real element rect so the AI
-      // cursor lands on the actual target instead of a heuristic zone.
-      if (turn.name === 'click' && turn.args?.selector && currentUrl) {
-        try {
-          const probe = await fcScrape(
-            currentUrl,
-            [...replay, { type: 'wait', milliseconds: 250 }, { type: 'executeJavascript', script: selectorRectScript(turn.args.selector) }],
-            ['html'],
-          )
-          const real = rectToCursor(parseRectFromScrape(probe))
-          if (real) {
-            cursor = real
-            prev = real
-            send('cursor', { actionIndex: step, x: real.x, y: real.y, label, busy: false })
-            await sleep(180)
-          }
-        } catch { /* keep heuristic cursor */ }
+      // For index-based clicks, we can use the stored element coordinates directly
+      // (already applied above). Probe the real rect only as a refinement when
+      // we have a resolved selector and the element coords weren't found.
+      if (turn.name === 'click' && turn.args?.index != null && currentUrl) {
+        const { selector: resolvedSel, element: resolvedEl } = resolveClickIndex(Number(turn.args.index), currentElements)
+        if (resolvedSel && !resolvedEl?.cx) {
+          try {
+            const probe = await fcScrape(
+              currentUrl,
+              [...replay, { type: 'wait', milliseconds: 250 }, { type: 'executeJavascript', script: selectorRectScript(resolvedSel) }],
+              ['html'],
+            )
+            const real = rectToCursor(parseRectFromScrape(probe))
+            if (real) {
+              cursor = real
+              prev = real
+              send('cursor', { actionIndex: step, x: real.x, y: real.y, label, busy: false })
+              await sleep(180)
+            }
+          } catch { /* keep element-coord cursor */ }
+        }
       }
 
       // 4. Execute tool.
@@ -1533,13 +1706,20 @@ app.post('/api/run-agent', async (req, res) => {
       }
       if (turn.name === 'navigate') {
         const newUrl = String(turn.args?.url || '').trim()
-        if (newUrl) { currentUrl = newUrl; replay = [] }
+        if (newUrl) { currentUrl = newUrl; replay = []; currentElements = [] }
         messages.push({ role: 'tool', tool_call_id: `c${step}`, content: `navigated to ${newUrl}` })
         continue
       }
-      const fcAct = agentToolToFirecrawl(turn.name, turn.args || {})
+      const fcAct = agentToolToFirecrawl(turn.name, turn.args || {}, currentElements)
       if (fcAct) replay.push(fcAct)
-      messages.push({ role: 'tool', tool_call_id: `c${step}`, content: 'OK' })
+      // Tell the model what we resolved the index to, so it has full context.
+      const toolResult = (turn.name === 'click' && turn.args?.index != null)
+        ? (() => {
+            const el = currentElements.find((e) => e.index === Number(turn.args.index))
+            return el ? `clicked [${el.index}] ${el.text || el.role || el.tag} (selector: ${el.selector})` : `click index ${turn.args.index} — element not found in current index`
+          })()
+        : 'OK'
+      messages.push({ role: 'tool', tool_call_id: `c${step}`, content: toolResult })
     }
 
     const durationMs = Date.now() - startMs
