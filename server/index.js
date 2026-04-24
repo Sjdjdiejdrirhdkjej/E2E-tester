@@ -1054,7 +1054,7 @@ app.post('/api/run-agent', async (req, res) => {
     let lastObservation = { url: currentUrl || '', title: '', text: '' }
     let aborted = false
     const ac = new AbortController()
-    req.on('close', () => { aborted = true; try { ac.abort() } catch {} })
+    res.on('close', () => { if (!res.writableEnded) { aborted = true; try { ac.abort() } catch {} } })
     const messages = [
       { role: 'system', content: AGENT_SYSTEM },
       { role: 'user', content: `Goal: ${goal}\n\n${currentUrl ? `Suggested starting URL: ${currentUrl}` : 'No starting URL provided — call navigate() first with a sensible https URL.'}` },
