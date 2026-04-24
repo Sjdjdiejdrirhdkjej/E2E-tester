@@ -749,63 +749,75 @@ function __findElement(sel) {
 }
 `
 
-// ===== browser-use style: numbered interactive-element index =====
+// ===== browser-use style: numbered interactive-element index + visual overlay =====
 //
-// Before each agent turn we inject this script into the page via Firecrawl's
-// `executeJavascript` action. It walks the visible DOM and assigns a 1-based
-// index to every interactive element, mirroring the way browser-use annotates
-// its DOM snapshot so the AI can say `click({ index: 3 })` instead of having
-// to invent a CSS selector.
+// Two scripts that mirror browser-use's DOM annotation approach:
 //
-// Return shape: { elements: [{ index, tag, role, text, type, placeholder,
-//   ariaLabel, href, selector, cx, cy }] }
+//   1. buildElementIndexAndOverlayScript() — runs first via executeJavascript.
+//      • Walks the visible DOM and assigns a 1-based index to every interactive
+//        element, exactly like browser-use's buildDomTree.js.
+//      • Injects a fixed-position overlay layer with a colored border around
+//        each element and a cyan badge showing its index number. The overlay is
+//        visible in the screenshot taken immediately after, so both the AI and
+//        the human viewer see the same numbered annotations.
+//      • Returns { elements: [...] } so the server can build the text index
+//        list and resolve click indices to stable selectors.
 //
-// `selector` is the best stable selector we can build for each element so the
-// server can pass it to `browserUseClickScript` when executing the click.
-function buildElementIndexScript() {
+//   2. removeOverlayScript() — runs after the screenshot to clean up the
+//      overlay before any real actions execute.
+//
+// Return shape per element: { index, tag, role, text, type, placeholder,
+//   ariaLabel, href, selector, x, y, w, h, cx, cy, disabled }
+
+function buildElementIndexAndOverlayScript() {
   return `(function(){
 try {
+  // ---- Remove any stale overlay from a previous turn ----
+  var _old = document.getElementById('__bu_idx_overlay');
+  if (_old) _old.remove();
+
+  // ---- Helper: is this element visible and on-screen? ----
   function __vis(el) {
     var r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) return false;
     var s = window.getComputedStyle(el);
     if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity||'1') < 0.05) return false;
-    if (r.bottom < 0 || r.top > window.innerHeight + 400) return false;
+    if (r.bottom < 0 || r.top > window.innerHeight + 200) return false;
     return true;
   }
   function __text(el) {
-    var t = (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim();
-    return t.slice(0, 80);
+    return (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim().slice(0, 80);
   }
   function __label(el) {
     var al = el.getAttribute('aria-label');
-    if (al) return al.trim().slice(0,80);
+    if (al) return al.trim().slice(0, 80);
     var lid = el.getAttribute('aria-labelledby');
     if (lid) { var le = document.getElementById(lid); if (le) return (le.innerText||le.textContent||'').trim().slice(0,80); }
-    var lbl = document.querySelector('label[for="'+el.id+'"]');
-    if (lbl) return (lbl.innerText||lbl.textContent||'').trim().slice(0,80);
+    if (el.id) { var lbl = document.querySelector('label[for="'+el.id+'"]'); if (lbl) return (lbl.innerText||lbl.textContent||'').trim().slice(0,80); }
     return '';
   }
   // Build the most stable selector we can for an element.
   function __sel(el) {
     var tag = el.tagName.toLowerCase();
-    if (el.id) { try { document.querySelector('#'+CSS.escape(el.id)); return '#'+CSS.escape(el.id); } catch(e) {} }
+    if (el.id) { try { if (document.querySelector('#'+CSS.escape(el.id))) return '#'+CSS.escape(el.id); } catch(e) {} }
     var name = el.getAttribute('name');
-    if (name) { var ns = tag+'[name='+JSON.stringify(name)+']'; try { if(document.querySelector(ns)) return ns; } catch(e){} }
+    if (name) { var ns = tag+'[name='+JSON.stringify(name)+']'; try { if (document.querySelector(ns)) return ns; } catch(e){} }
     var al = el.getAttribute('aria-label');
     if (al) return '[aria-label='+JSON.stringify(al)+']';
     var ph = el.getAttribute('placeholder');
     if (ph) return '[placeholder='+JSON.stringify(ph)+']';
     var txt = __text(el);
-    if (txt && txt.length >= 2 && txt.length <= 60) return 'text='+txt;
+    if (txt && txt.length >= 2 && txt.length <= 50) return 'text='+txt;
     var type = el.getAttribute('type');
     if (type) return tag+'[type='+JSON.stringify(type)+']';
     return tag;
   }
-  var INTERACTIVE = 'a[href],button,input:not([type=hidden]),select,textarea,details,summary,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="tab"],[role="menuitem"],[role="combobox"],[role="option"],[role="switch"],[tabindex]';
+
+  var INTERACTIVE = 'a[href],button,input:not([type=hidden]),select,textarea,details>summary,[role="button"],[role="link"],[role="checkbox"],[role="radio"],[role="tab"],[role="menuitem"],[role="combobox"],[role="option"],[role="switch"],[tabindex]:not([tabindex="-1"])';
   var all = Array.from(document.querySelectorAll(INTERACTIVE));
-  var seen = new Set();
+  var seen = new WeakSet();
   var elements = [];
+
   for (var i = 0; i < all.length; i++) {
     var el = all[i];
     if (!__vis(el)) continue;
@@ -825,14 +837,71 @@ try {
       ariaLabel: el.getAttribute('aria-label') || '',
       href: (tag === 'a' && el.href) ? String(el.href).slice(0, 120) : '',
       selector: __sel(el),
+      x: Math.round(rect.left),
+      y: Math.round(rect.top),
+      w: Math.round(rect.width),
+      h: Math.round(rect.height),
       cx: Math.round(rect.left + rect.width / 2),
       cy: Math.round(rect.top + rect.height / 2),
       disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
     });
-    if (elements.length >= 80) break; // cap to keep payload small
+    if (elements.length >= 80) break;
   }
+
+  // ---- Inject the visual overlay (browser-use style) ----
+  var overlay = document.createElement('div');
+  overlay.id = '__bu_idx_overlay';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483647;overflow:visible;';
+
+  for (var j = 0; j < elements.length; j++) {
+    var e = elements[j];
+    var color = e.disabled ? '#94a3b8' : '#06b6d4';
+
+    // Border box around the element
+    var box = document.createElement('div');
+    box.style.cssText = 'position:fixed;box-sizing:border-box;pointer-events:none;border-radius:3px;';
+    box.style.left   = e.x + 'px';
+    box.style.top    = e.y + 'px';
+    box.style.width  = e.w + 'px';
+    box.style.height = e.h + 'px';
+    box.style.border = '2px solid ' + color;
+    box.style.background = 'rgba(6,182,212,0.05)';
+
+    // Index badge in the top-left corner
+    var badge = document.createElement('div');
+    badge.textContent = String(e.index);
+    badge.style.cssText = [
+      'position:absolute',
+      'top:-1px',
+      'left:-1px',
+      'background:' + color,
+      'color:#fff',
+      'font-size:10px',
+      'font-weight:700',
+      'font-family:monospace,sans-serif',
+      'line-height:15px',
+      'padding:0 4px',
+      'border-radius:2px 0 2px 0',
+      'white-space:nowrap',
+    ].join(';');
+
+    box.appendChild(badge);
+    overlay.appendChild(box);
+  }
+
+  document.documentElement.appendChild(overlay);
   return { elements: elements };
 } catch(e) { return { elements: [], error: String(e&&e.message||e) }; }
+})()`
+}
+
+// Remove the overlay injected by buildElementIndexAndOverlayScript.
+// Run this after the screenshot so real page interactions aren't blocked.
+function removeOverlayScript() {
+  return `(function(){
+  var el = document.getElementById('__bu_idx_overlay');
+  if (el) el.remove();
+  return { removed: true };
 })()`
 }
 
@@ -1548,13 +1617,16 @@ app.post('/api/run-agent', async (req, res) => {
       if (currentUrl) {
         send('cursor', { actionIndex: step, x: prev.x, y: prev.y, label: `observing ${currentUrl}`, busy: true })
         try {
-          // Include the element-index extraction script so we get the numbered
-          // element list in the same Firecrawl call as the screenshot.
+          // browser-use style observation:
+          //   1. Inject numbered overlay badges onto the live page
+          //   2. Screenshot — AI sees the same numbered annotations as the text list
+          //   3. Remove overlay — so it doesn't interfere with real click actions
           const acts = [
             ...replay,
             { type: 'wait', milliseconds: 400 },
+            { type: 'executeJavascript', script: buildElementIndexAndOverlayScript() },
             { type: 'screenshot' },
-            { type: 'executeJavascript', script: buildElementIndexScript() },
+            { type: 'executeJavascript', script: removeOverlayScript() },
           ]
           lastScrape = await fcScrape(currentUrl, acts, ['screenshot', 'html', 'markdown'])
           const shot = (lastScrape?.actions?.screenshots || [])[ (lastScrape?.actions?.screenshots || []).length - 1 ] || lastScrape?.screenshot

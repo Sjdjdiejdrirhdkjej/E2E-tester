@@ -38,14 +38,22 @@ was empty on import, so this is a fresh scaffold.
 - `FIREWORKS_API_KEY`
 - `FIRECRAWL_API_KEY`
 
-## AI cursor positioning
-- Click / wait-for-selector steps include an `executeJavascript` probe that
-  returns `getBoundingClientRect()` of the target plus the page viewport
-  (`selectorRectScript` in `server/index.js`). The server reads the rect from
-  `actions.javascriptReturns`, normalizes to 0..1 via `rectToCursor`, and
-  emits a `cursor` event so the on-screen cursor lands on the actual element.
-- Falls back to the heuristic `estimateCursor` zones for non-selector actions
-  (write/press/scroll) and when the probe returns nothing.
+## browser-use style element index (agent mode)
+- Before each agent turn, `buildElementIndexAndOverlayScript()` runs in the
+  page via Firecrawl `executeJavascript`. It assigns `[1]`, `[2]`, `[3]`…
+  indices to every visible interactive element and injects a fixed-position
+  overlay with cyan border + badge per element — matching browser-use's DOM
+  annotation approach.
+- The screenshot is taken *with the overlay visible*, so the AI vision model
+  and the human viewer see the same numbered annotations.
+- `removeOverlayScript()` cleans up the overlay immediately after, before any
+  real click actions execute.
+- The agent tool `click({ index: N })` replaces the old `click({ selector })`.
+  The server resolves the index to the stored stable selector and runs
+  `browserUseClickScript` — no CSS selector guessing required.
+- Cursor coordinates come directly from the element's `getBoundingClientRect()`
+  stored in the index, falling back to `estimateCursor` heuristics for
+  non-click actions (type/press/scroll).
 
 ## Background runs
 - `POST /api/run-stream` and `POST /api/run-agent` no longer hold the SSE
