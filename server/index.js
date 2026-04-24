@@ -615,6 +615,101 @@ function evaluateExpectations(plan, scrape) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)) }
 
+// ====== Background run registry ======
+//
+// Each E2E run is tied to a task id. While a run is in progress the worker
+// pushes events into the registry, and any number of HTTP clients can attach
+// to /api/runs/:taskId/events to replay buffered events and subscribe to new
+// ones. Because the worker is decoupled from the SSE socket, closing the tab
+// or switching tasks no longer kills the test — the run keeps going and the
+// client can re-attach later (or another tab can attach in parallel).
+//
+// On terminal events (done / error / aborted) we persist the final task
+// snapshot to PG so a fresh page load reflects the result even if no client
+// was attached when the run finished.
+const runRegistry = new Map()
+
+function createOrResetRun(taskId, kind) {
+  const existing = runRegistry.get(taskId)
+  if (existing) {
+    if (existing.ac && existing.status === 'running') { try { existing.ac.abort() } catch {} }
+    for (const res of existing.subs) {
+      try { res.write(`event: end\ndata: ${JSON.stringify({ status: 'replaced' })}\n\n`); res.end() } catch {}
+    }
+    existing.subs.clear()
+    if (existing.heartbeats) for (const h of existing.heartbeats.values()) clearInterval(h)
+  }
+  const r = {
+    taskId,
+    kind,                 // 'planned' | 'agent'
+    status: 'running',    // 'running' | 'done' | 'error' | 'aborted'
+    events: [],           // [{ event, data, t }]
+    subs: new Set(),      // res objects
+    heartbeats: new Map(),
+    ac: new AbortController(),
+    startedAt: Date.now(),
+    finishedAt: null,
+    taskPatch: {},        // accumulated final state to persist on completion
+  }
+  runRegistry.set(taskId, r)
+  return r
+}
+
+function runEvent(taskId, event, data) {
+  const r = runRegistry.get(taskId)
+  if (!r) return
+  const entry = { event, data, t: Date.now() }
+  r.events.push(entry)
+  // Cap the replay buffer so long runs don't grow unbounded. Keep the very
+  // first event (usually `start`) so late attachers still see what kicked off.
+  if (r.events.length > 4000) r.events.splice(1, r.events.length - 3500)
+  for (const res of r.subs) {
+    try {
+      res.write(`event: ${event}\n`)
+      res.write(`data: ${JSON.stringify(data)}\n\n`)
+    } catch {}
+  }
+}
+
+function patchRunTask(taskId, patch) {
+  const r = runRegistry.get(taskId)
+  if (!r) return
+  r.taskPatch = { ...r.taskPatch, ...patch }
+}
+
+async function persistFinalTask(r) {
+  if (!r || !r.taskId || !r.taskPatch || Object.keys(r.taskPatch).length === 0) return
+  if (!dbReady) return
+  try {
+    const existing = await getTask(r.taskId)
+    if (!existing) return
+    // Drop ephemeral live-stage keys that we don't want stored as the final
+    // record (matches the frontend's `stripForPersist`).
+    const { stage: _s, summaryStreaming: _ss, ...patch } = r.taskPatch
+    await upsertTask({ ...existing, ...patch, id: r.taskId })
+  } catch (err) {
+    console.warn('persist final task failed', err)
+  }
+}
+
+async function endRun(taskId, status) {
+  const r = runRegistry.get(taskId)
+  if (!r) return
+  if (r.status !== 'running') return // already ended
+  r.status = status
+  r.finishedAt = Date.now()
+  await persistFinalTask(r)
+  for (const res of r.subs) {
+    try { res.write(`event: end\ndata: ${JSON.stringify({ status })}\n\n`); res.end() } catch {}
+  }
+  for (const h of r.heartbeats.values()) clearInterval(h)
+  r.subs.clear()
+  r.heartbeats.clear()
+  // Keep the registry entry around for ~10 minutes so a late attach can
+  // replay the full event log and see the verdict.
+  setTimeout(() => { runRegistry.delete(taskId) }, 10 * 60 * 1000).unref?.()
+}
+
 // Build a JS snippet for Firecrawl's `executeJavascript` action that returns
 // the bounding rect of a selector + the viewport size. Handles plain CSS
 // selectors and Playwright text-engine selectors (text=Foo, text=/foo/i).
@@ -1086,31 +1181,25 @@ async function fetchAsDataUrl(url, signal) {
 }
 
 app.post('/api/run-agent', async (req, res) => {
-  res.set({
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-    'X-Accel-Buffering': 'no',
-    'Content-Encoding': 'identity',
-  })
-  try { req.socket?.setNoDelay?.(true) } catch {}
-  res.flushHeaders?.()
-  res.write(`: ${' '.repeat(2048)}\n\n`)
-  const send = (event, data) => {
-    res.write(`event: ${event}\n`)
-    res.write(`data: ${JSON.stringify(data)}\n\n`)
-  }
-  const heartbeat = setInterval(() => { try { res.write(`: hb ${Date.now()}\n\n`) } catch {} }, 10000)
-  const end = () => { clearInterval(heartbeat); try { res.end() } catch {} }
+  // Background mode: kick off the agent loop, return immediately, and let
+  // clients attach to /api/runs/:taskId/events to receive live + replayed
+  // events. The run keeps going even if no client is attached.
+  if (!FIREWORKS_API_KEY) return res.status(400).json({ error: 'FIREWORKS_API_KEY missing' })
+  if (!FIRECRAWL_API_KEY) return res.status(400).json({ error: 'FIRECRAWL_API_KEY missing' })
+  const { goal, startUrl, taskId } = req.body || {}
+  if (!goal || typeof goal !== 'string') return res.status(400).json({ error: 'goal required' })
+  if (!taskId || typeof taskId !== 'string') return res.status(400).json({ error: 'taskId required' })
 
-  try {
-    if (!FIREWORKS_API_KEY) { send('error', { error: 'FIREWORKS_API_KEY missing' }); return end() }
-    if (!FIRECRAWL_API_KEY) { send('error', { error: 'FIRECRAWL_API_KEY missing' }); return end() }
-    const { goal, startUrl } = req.body || {}
-    if (!goal || typeof goal !== 'string') { send('error', { error: 'goal required' }); return end() }
+  const r = createOrResetRun(taskId, 'agent')
+  res.json({ started: true, taskId, kind: 'agent' })
 
+  ;(async () => {
+    const send = (event, data) => runEvent(taskId, event, data)
+    const ac = r.ac
     const startMs = Date.now()
     send('start', { goal, startUrl: startUrl || null })
+
+    try {
 
     async function fcScrape(url, actions, formats = ['screenshot']) {
       const r = await fetch('https://api.firecrawl.dev/v1/scrape', {
@@ -1130,9 +1219,8 @@ app.post('/api/run-agent', async (req, res) => {
     let lastShot = null
     let lastScrape = null
     let lastObservation = { url: currentUrl || '', title: '', text: '' }
-    let aborted = false
-    const ac = new AbortController()
-    res.on('close', () => { if (!res.writableEnded) { aborted = true; try { ac.abort() } catch {} } })
+    let aborted = ac.signal.aborted
+    ac.signal.addEventListener('abort', () => { aborted = true })
     const messages = [
       { role: 'system', content: AGENT_SYSTEM },
       { role: 'user', content: `Goal: ${goal}\n\n${currentUrl ? `Suggested starting URL: ${currentUrl}` : 'No starting URL provided — call navigate() first with a sensible https URL.'}` },
@@ -1200,8 +1288,10 @@ app.post('/api/run-agent', async (req, res) => {
         })
       } catch (err) {
         if (aborted) break
-        send('error', { error: `Agent step ${step + 1} failed: ${err.message || err}` })
-        return end()
+        const msg = `Agent step ${step + 1} failed: ${err.message || err}`
+        send('error', { error: msg })
+        patchRunTask(taskId, { status: 'fail', error: msg })
+        return
       }
       if (aborted) break
       if (!turn.name) {
@@ -1217,12 +1307,16 @@ app.post('/api/run-agent', async (req, res) => {
           })
         } catch (err) {
           if (aborted) break
-          send('error', { error: `Agent step ${step + 1} retry failed: ${err.message || err}` })
-          return end()
+          const msg = `Agent step ${step + 1} retry failed: ${err.message || err}`
+          send('error', { error: msg })
+          patchRunTask(taskId, { status: 'fail', error: msg })
+          return
         }
         if (!turn?.name) {
-          send('error', { error: `Agent step ${step + 1} returned no tool call after retry` })
-          return end()
+          const msg = `Agent step ${step + 1} returned no tool call after retry`
+          send('error', { error: msg })
+          patchRunTask(taskId, { status: 'fail', error: msg })
+          return
         }
       }
 
@@ -1298,56 +1392,50 @@ app.post('/api/run-agent', async (req, res) => {
       { plan: { name: goal, url: startUrl || finalUrl }, finalUrl, title, expectations, passed, durationMs },
       (delta) => send('summary_delta', { delta })
     )
-    send('done', { summary, expectations, passed, finalUrl, title, durationMs, screenshots: lastShot ? [lastShot] : [], verdict })
-    end()
-  } catch (err) {
-    console.error('run-agent error:', err)
-    try { send('error', { error: String(err.message || err) }) } catch {}
-    end()
-  }
+    const screenshots = lastShot ? [lastShot] : []
+    send('done', { summary, expectations, passed, finalUrl, title, durationMs, screenshots, verdict })
+    patchRunTask(taskId, {
+      status: passed ? 'pass' : 'fail',
+      duration: durationMs,
+      screenshots,
+      expectations,
+      finalUrl,
+      title,
+      summary,
+    })
+    } catch (err) {
+      console.error('run-agent error:', err)
+      const isAbort = err?.name === 'AbortError' || ac.signal.aborted
+      if (!isAbort) {
+        try { send('error', { error: String(err.message || err) }) } catch {}
+        patchRunTask(taskId, { status: 'fail', error: String(err.message || err) })
+      }
+    } finally {
+      const finalStatus = ac.signal.aborted ? 'aborted' : (r.taskPatch?.status === 'fail' ? 'error' : 'done')
+      try { await endRun(taskId, finalStatus) } catch {}
+    }
+  })()
 })
 
 app.post('/api/run-stream', async (req, res) => {
-  // --- Streaming hardening ---
-  // The combination of Replit's https proxy + Vite's dev http-proxy + Node's
-  // default TCP Nagle coalescing can make SSE look "one big response at the
-  // end" even though we're writing events progressively. The settings below
-  // defeat every buffer we know about on that path.
-  res.set({
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-    'X-Accel-Buffering': 'no',          // nginx / GCP L7
-    'Content-Encoding': 'identity',     // forbid any on-the-fly gzip
-  })
-  // Turn off Nagle so each res.write() is flushed as its own TCP segment.
-  try { req.socket?.setNoDelay?.(true) } catch {}
-  try { req.socket?.setKeepAlive?.(true, 15000) } catch {}
-  // Some proxies keep a small read buffer (~2-4KB) before they emit anything.
-  // A 2KB comment pre-amble guarantees the client sees bytes immediately.
-  res.flushHeaders?.()
-  res.write(`: ${' '.repeat(2048)}\n\n`)
+  // Background mode: the planned-run worker is decoupled from the SSE socket.
+  // We register the run in `runRegistry`, return immediately, and clients
+  // attach to /api/runs/:taskId/events to follow along.
+  if (!FIRECRAWL_API_KEY) return res.status(400).json({ error: 'FIRECRAWL_API_KEY missing' })
+  const { plan, taskId } = req.body || {}
+  if (!plan || !plan.url) return res.status(400).json({ error: 'plan with url required' })
+  if (!taskId || typeof taskId !== 'string') return res.status(400).json({ error: 'taskId required' })
 
-  const send = (event, data) => {
-    res.write(`event: ${event}\n`)
-    res.write(`data: ${JSON.stringify(data)}\n\n`)
-  }
+  const r = createOrResetRun(taskId, 'planned')
+  res.json({ started: true, taskId, kind: 'planned' })
 
-  // Heartbeat comment every 10s so intermediaries don't time out or buffer
-  // during the occasional slow Firecrawl step. SSE clients ignore `:` lines.
-  const heartbeat = setInterval(() => {
-    try { res.write(`: hb ${Date.now()}\n\n`) } catch {}
-  }, 10000)
-  const clientGone = () => { clearInterval(heartbeat) }
-  req.on('close', clientGone)
-  res.on('close', clientGone)
-  const end = () => { clearInterval(heartbeat); try { res.end() } catch {} }
+  ;(async () => {
+    const send = (event, data) => runEvent(taskId, event, data)
+    const ac = r.ac
+    let aborted = ac.signal.aborted
+    ac.signal.addEventListener('abort', () => { aborted = true })
 
-  try {
-    if (!FIRECRAWL_API_KEY) { send('error', { error: 'FIRECRAWL_API_KEY missing' }); return end() }
-    const { plan } = req.body || {}
-    if (!plan || !plan.url) { send('error', { error: 'plan with url required' }); return end() }
-
+    try {
     send('start', { url: plan.url, totalActions: plan.actions.length })
     const start = Date.now()
 
@@ -1633,13 +1721,101 @@ ${trimmedHtml}`
       { plan, finalUrl, title, expectations, passed, durationMs },
       (delta) => send('summary_delta', { delta })
     )
-    send('done', { summary, expectations, passed, finalUrl, title, durationMs, screenshots: lastShot ? [lastShot] : [] })
-    end()
-  } catch (err) {
-    console.error('run-stream error:', err)
-    try { send('error', { error: String(err.message || err) }) } catch {}
-    end()
+    const screenshots = lastShot ? [lastShot] : []
+    send('done', { summary, expectations, passed, finalUrl, title, durationMs, screenshots })
+    patchRunTask(taskId, {
+      status: passed ? 'pass' : 'fail',
+      duration: durationMs,
+      screenshots,
+      expectations,
+      finalUrl,
+      title,
+      summary,
+    })
+    } catch (err) {
+      console.error('run-stream error:', err)
+      const isAbort = err?.name === 'AbortError' || ac.signal.aborted
+      if (!isAbort) {
+        try { send('error', { error: String(err.message || err) }) } catch {}
+        patchRunTask(taskId, { status: 'fail', error: String(err.message || err) })
+      }
+    } finally {
+      const finalStatus = ac.signal.aborted ? 'aborted' : (r.taskPatch?.status === 'fail' ? 'error' : 'done')
+      try { await endRun(taskId, finalStatus) } catch {}
+    }
+  })()
+})
+
+// ===== Background run subscription endpoints =====
+//
+// GET  /api/runs/:taskId/events   — SSE: replay buffered events + subscribe live
+// GET  /api/runs/:taskId/status   — quick JSON status check (used on app load
+//                                    to decide whether to re-attach to a run)
+// POST /api/runs/:taskId/abort    — stop a running background run
+
+app.get('/api/runs/:taskId/status', (req, res) => {
+  const r = runRegistry.get(req.params.taskId)
+  if (!r) return res.json({ exists: false })
+  res.json({
+    exists: true,
+    status: r.status,
+    kind: r.kind,
+    eventCount: r.events.length,
+    startedAt: r.startedAt,
+    finishedAt: r.finishedAt,
+  })
+})
+
+app.post('/api/runs/:taskId/abort', async (req, res) => {
+  const r = runRegistry.get(req.params.taskId)
+  if (!r) return res.status(404).json({ error: 'not found' })
+  if (r.status !== 'running') return res.json({ ok: true, status: r.status })
+  try { r.ac.abort() } catch {}
+  runEvent(req.params.taskId, 'error', { error: 'Stopped by user' })
+  patchRunTask(req.params.taskId, { status: 'fail', error: 'Stopped by user' })
+  await endRun(req.params.taskId, 'aborted')
+  res.json({ ok: true, status: 'aborted' })
+})
+
+app.get('/api/runs/:taskId/events', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Content-Encoding': 'identity',
+  })
+  try { req.socket?.setNoDelay?.(true) } catch {}
+  try { req.socket?.setKeepAlive?.(true, 15000) } catch {}
+  res.flushHeaders?.()
+  res.write(`: ${' '.repeat(2048)}\n\n`)
+
+  const r = runRegistry.get(req.params.taskId)
+  if (!r) {
+    res.write(`event: end\ndata: ${JSON.stringify({ status: 'not_found' })}\n\n`)
+    return res.end()
   }
+
+  // Replay buffered events so a late attach catches up to the present.
+  for (const e of r.events) {
+    res.write(`event: ${e.event}\n`)
+    res.write(`data: ${JSON.stringify(e.data)}\n\n`)
+  }
+  if (r.status !== 'running') {
+    res.write(`event: end\ndata: ${JSON.stringify({ status: r.status })}\n\n`)
+    return res.end()
+  }
+  // Subscribe to live events. Heartbeat every 10s so proxies don't time out.
+  r.subs.add(res)
+  const hb = setInterval(() => { try { res.write(`: hb ${Date.now()}\n\n`) } catch {} }, 10000)
+  r.heartbeats.set(res, hb)
+  const cleanup = () => {
+    clearInterval(hb)
+    r.heartbeats.delete(res)
+    r.subs.delete(res)
+  }
+  req.on('close', cleanup)
+  res.on('close', cleanup)
 })
 
 app.post('/api/run', async (req, res) => {

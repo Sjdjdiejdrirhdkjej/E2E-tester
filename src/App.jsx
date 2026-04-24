@@ -93,16 +93,104 @@ async function streamSse(url, body, handlers, signal) {
   }
 }
 
-async function streamRun(plan, handlers) {
-  return streamSse('/api/run-stream', { plan }, handlers)
-}
-
 async function streamPlan(prompt, handlers) {
   return streamSse('/api/plan-stream', { prompt }, handlers)
 }
 
-async function streamAgent(goal, handlers, startUrl, signal) {
-  return streamSse('/api/run-agent', { goal, startUrl }, handlers, signal)
+// ----- Background runs: kick off + attach via /api/runs/:taskId/events -----
+//
+// The server now keeps each run alive independently of any HTTP socket.
+// `startBackgroundRun` POSTs the kickoff and returns once the worker has been
+// registered. `attachRunStream` opens an SSE connection that first replays
+// the buffered event log and then streams live events. The returned object
+// has `close()` to detach without aborting the server-side run, and
+// `done` (a Promise) that resolves when the run reaches a terminal state.
+async function startBackgroundRun(endpoint, body) {
+  const r = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const text = await r.text()
+  let data = null
+  try { data = JSON.parse(text) } catch {}
+  if (!r.ok) throw new Error(data?.error || text || `HTTP ${r.status}`)
+  return data
+}
+
+function attachRunStream(taskId, handlers) {
+  const ctrl = new AbortController()
+  let closed = false
+  let resolveDone
+  const done = new Promise((resolve) => { resolveDone = resolve })
+
+  ;(async () => {
+    try {
+      const r = await fetch(`/api/runs/${encodeURIComponent(taskId)}/events`, {
+        method: 'GET',
+        headers: { Accept: 'text/event-stream' },
+        signal: ctrl.signal,
+      })
+      if (!r.ok || !r.body) {
+        handlers.error?.({ error: `attach HTTP ${r.status}` })
+        resolveDone({ status: 'error' })
+        return
+      }
+      const reader = r.body.getReader()
+      const decoder = new TextDecoder()
+      let buf = ''
+      while (!closed) {
+        const { done: streamDone, value } = await reader.read()
+        if (streamDone) break
+        buf += decoder.decode(value, { stream: true })
+        let idx
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const raw = buf.slice(0, idx)
+          buf = buf.slice(idx + 2)
+          let event = 'message'; let data = ''
+          for (const line of raw.split('\n')) {
+            if (line.startsWith('event: ')) event = line.slice(7).trim()
+            else if (line.startsWith('data: ')) data += line.slice(6)
+          }
+          if (!data) continue
+          let payload
+          try { payload = JSON.parse(data) } catch { continue }
+          if (event === 'end') {
+            resolveDone({ status: payload?.status || 'done' })
+            closed = true
+            try { reader.cancel() } catch {}
+            return
+          }
+          handlers[event]?.(payload)
+        }
+      }
+      resolveDone({ status: 'closed' })
+    } catch (err) {
+      if (!closed) handlers.error?.({ error: String(err.message || err) })
+      resolveDone({ status: 'error' })
+    }
+  })()
+
+  return {
+    close() { closed = true; try { ctrl.abort() } catch {} },
+    done,
+  }
+}
+
+async function abortBackgroundRun(taskId) {
+  try {
+    await fetch(`/api/runs/${encodeURIComponent(taskId)}/abort`, { method: 'POST' })
+  } catch (err) {
+    console.warn('abort failed', err)
+  }
+}
+
+async function getRunStatus(taskId) {
+  try {
+    const r = await fetch(`/api/runs/${encodeURIComponent(taskId)}/status`)
+    if (!r.ok) return null
+    return await r.json()
+  } catch { return null }
 }
 
 export default function App() {
@@ -113,21 +201,44 @@ export default function App() {
   const [planMode, setPlanMode] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
   const streamRef = useRef(null)
-  const abortRef = useRef(null)
+  // Map<taskId, { close, done }> — active background-run subscriptions. Keyed
+  // by the task id so multiple runs can be observed in parallel and switching
+  // tasks doesn't kill any in-flight work.
+  const streamsRef = useRef(new Map())
+  // Tasks the user has explicitly stopped — used so the SSE `error` event
+  // we synthesise on the server during abort doesn't get re-applied as a
+  // generic failure on top of the "Stopped by user" state.
+  const stoppedRef = useRef(new Set())
 
-  function stopRun() {
-    if (abortRef.current) {
-      try { abortRef.current.abort() } catch {}
-      abortRef.current = null
-    }
-    setTests((prev) => prev.map((t) => (t.status === 'running' || t.status === 'planning') ? {
-      ...t,
-      status: 'fail',
-      error: 'Stopped by user',
-      summaryStreaming: false,
-      stage: t.stage ? { ...t.stage, label: 'stopped', finished: true, busy: false } : null,
-    } : t))
+  function detachStream(taskId) {
+    const s = streamsRef.current.get(taskId)
+    if (s) { try { s.close() } catch {}; streamsRef.current.delete(taskId) }
+  }
+
+  async function stopRun() {
+    // Abort any task that is still running or planning. The server keeps the
+    // run alive even if the client navigates away, so we explicitly tell it
+    // to stop via /api/runs/:taskId/abort.
+    const targets = []
+    setTests((prev) => prev.map((t) => {
+      if (t.status === 'running' || t.status === 'planning') {
+        targets.push(t.id)
+        stoppedRef.current.add(t.id)
+        return {
+          ...t,
+          status: 'fail',
+          error: 'Stopped by user',
+          summaryStreaming: false,
+          stage: t.stage ? { ...t.stage, label: 'stopped', finished: true, busy: false } : null,
+        }
+      }
+      return t
+    }))
     setBusy(false)
+    for (const id of targets) {
+      detachStream(id)
+      abortBackgroundRun(id)
+    }
   }
 
   const selected = useMemo(() => tests.find((t) => t.id === selectedId) || null, [tests, selectedId])
@@ -137,21 +248,46 @@ export default function App() {
       const r = await fetch('/api/tasks')
       if (!r.ok) return
       const data = await r.json()
-      if (Array.isArray(data?.tasks)) {
-        // Reset any non-terminal status from a prior session.
-        const cleaned = data.tasks.map((t) => {
-          if (t.status === 'running' || t.status === 'planning') {
-            return { ...t, status: 'fail', error: t.error || 'Interrupted (server restarted)' }
-          }
-          return t
-        })
-        setTests((prev) => {
-          // Preserve any in-flight task in this session that the server doesn't know yet.
-          const serverIds = new Set(cleaned.map((t) => t.id))
-          const localOnly = prev.filter((t) => !serverIds.has(t.id) && (t.status === 'running' || t.status === 'planning' || t.status === 'clarifying'))
-          return [...localOnly, ...cleaned]
-        })
+      if (!Array.isArray(data?.tasks)) return
+
+      // For any task the DB still has marked as in-flight, ask the server
+      // whether the run is genuinely still running in the background. If so,
+      // keep its status and re-attach the SSE stream (so we replay everything
+      // that happened while we were away and continue receiving live events).
+      const candidates = data.tasks.filter((t) => t.status === 'running' || t.status === 'planning')
+      const liveStatuses = await Promise.all(
+        candidates.map(async (t) => [t.id, await getRunStatus(t.id)])
+      )
+      const liveIds = new Set(
+        liveStatuses
+          .filter(([, s]) => s && s.exists && s.status === 'running')
+          .map(([id]) => id)
+      )
+
+      const cleaned = data.tasks.map((t) => {
+        if ((t.status === 'running' || t.status === 'planning') && !liveIds.has(t.id)) {
+          return { ...t, status: 'fail', error: t.error || 'Interrupted (server restarted)' }
+        }
+        return t
+      })
+
+      setTests((prev) => {
+        const serverIds = new Set(cleaned.map((t) => t.id))
+        const localOnly = prev.filter((t) => !serverIds.has(t.id) && (t.status === 'running' || t.status === 'planning' || t.status === 'clarifying'))
+        return [...localOnly, ...cleaned]
+      })
+
+      // Reattach to any run the server confirmed is still going. We only
+      // attach once per id — if there's already an active subscription
+      // (e.g. the user pulled-to-refresh while a run is in flight) skip it.
+      for (const id of liveIds) {
+        if (streamsRef.current.has(id)) continue
+        const handlers = buildRunHandlers(id)
+        const sub = attachRunStream(id, handlers)
+        streamsRef.current.set(id, sub)
+        sub.done.then(() => finalizeRun(id))
       }
+      if (liveIds.size > 0) setBusy(true)
     } catch (err) {
       console.warn('load tasks failed', err)
     }
@@ -209,6 +345,126 @@ export default function App() {
     }))
   }
 
+  // Single source of truth for run-event handling. Returned object is wired
+  // to the SSE stream both for fresh runs and when re-attaching after a
+  // reload / tab switch — the handlers operate purely on `id`, so the same
+  // factory works for either case.
+  function buildRunHandlers(id) {
+    return {
+      start: (p) => {
+        update(id, {
+          url: p.startUrl || p.url || null,
+          stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'spinning up browser…', actionIndex: -1, finished: false },
+        })
+      },
+      observation: (p) => {
+        if (!p.url) return
+        if (p.error) pushActivity(id, { kind: 'system', text: `Step ${p.step + 1}: page load failed — ${p.error}` })
+        else pushActivity(id, { kind: 'system', text: `Step ${p.step + 1}: observing ${p.title ? `"${p.title}" — ` : ''}${p.url}` })
+      },
+      reasoning_delta: (p) => appendReasoning(id, 'reasoning', p.delta || ''),
+      content_delta: (p) => appendReasoning(id, 'plan_json', p.delta || ''),
+      cursor: (p) => {
+        setTests((prev) => prev.map((t) => t.id === id ? {
+          ...t,
+          stage: { ...(t.stage || {}), cursor: { x: p.x, y: p.y }, label: p.label, actionIndex: p.actionIndex, busy: Boolean(p.busy) }
+        } : t))
+      },
+      thinking: (p) => {
+        finalizeReasoning(id)
+        pushActivity(id, { kind: 'tool_call', tool: p.tool, args: p.args, label: p.label, rationale: p.rationale, actionIndex: p.actionIndex })
+        setTests((prev) => prev.map((t) => t.id === id ? {
+          ...t,
+          actions: [...(t.actions || []), { tool: p.tool, args: p.args }],
+          stepDescriptions: [...(t.stepDescriptions || []), p.label],
+        } : t))
+      },
+      frame: (p) => {
+        setTests((prev) => prev.map((t) => t.id === id ? {
+          ...t,
+          stage: { ...(t.stage || {}), image: p.image, actionIndex: p.actionIndex }
+        } : t))
+      },
+      summary_start: (p) => {
+        setTests((prev) => {
+          const next = prev.map((t) => t.id === id ? {
+            ...t,
+            status: p.passed ? 'pass' : 'fail',
+            duration: p.durationMs,
+            expectations: p.expectations || [],
+            finalUrl: p.finalUrl,
+            title: p.title,
+            summary: '',
+            summaryStreaming: true,
+            stage: t.stage ? { ...t.stage, label: p.passed ? 'done' : 'failed', finished: true } : null,
+          } : t)
+          const u = next.find((t) => t.id === id)
+          if (u) persistTask(u)
+          return next
+        })
+      },
+      summary_delta: (p) => {
+        setTests((prev) => prev.map((t) => t.id === id
+          ? { ...t, summary: (t.summary || '') + (p.delta || '') }
+          : t))
+      },
+      done: (p) => {
+        setTests((prev) => {
+          const next = prev.map((t) => t.id === id ? {
+            ...t,
+            status: p.passed ? 'pass' : 'fail',
+            duration: p.durationMs,
+            screenshots: p.screenshots || [],
+            expectations: p.expectations || [],
+            finalUrl: p.finalUrl,
+            title: p.title,
+            summary: p.summary || t.summary,
+            summaryStreaming: false,
+            stage: {
+              image: (p.screenshots && p.screenshots[p.screenshots.length - 1]) || t.stage?.image || null,
+              cursor: t.stage?.cursor || { x: 0.5, y: 0.5 },
+              label: p.passed ? 'done' : 'failed',
+              actionIndex: -1,
+              finished: true,
+            },
+          } : t)
+          const u = next.find((t) => t.id === id)
+          if (u) persistTask(u)
+          return next
+        })
+      },
+      error: (p) => {
+        // Don't clobber a "Stopped by user" state with the generic error
+        // event the server emits during abort.
+        if (stoppedRef.current.has(id)) return
+        setTests((prev) => {
+          const next = prev.map((t) => t.id === id ? {
+            ...t,
+            status: 'fail',
+            error: p.error,
+            summary: null,
+            stage: t.stage ? { ...t.stage, label: 'error', finished: true } : null,
+          } : t)
+          const u = next.find((t) => t.id === id)
+          if (u) persistTask(u)
+          return next
+        })
+      },
+    }
+  }
+
+  // Detach + clear `busy` when the server reports the run is over. Used by
+  // both fresh starts and re-attaches; safe to call multiple times.
+  function finalizeRun(id) {
+    detachStream(id)
+    stoppedRef.current.delete(id)
+    setBusy((b) => {
+      // Only clear `busy` if the still-active set has no more in-flight runs.
+      const anyLive = Array.from(streamsRef.current.keys()).length > 0
+      return anyLive ? b : false
+    })
+  }
+
   async function executePlannedRun(id, plan, displayNameFallback) {
     update(id, {
       status: 'running',
@@ -224,95 +480,13 @@ export default function App() {
     pushActivity(id, { kind: 'system', text: `Run starting · ${plan.actions.length} actions` })
 
     try {
-      await streamRun(plan, {
-        start: () => {
-          update(id, { stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'spinning up browser…', actionIndex: -1, finished: false } })
-        },
-        cursor: (p) => {
-          setTests((prev) => prev.map((t) => t.id === id ? {
-            ...t,
-            stage: { ...(t.stage || {}), cursor: { x: p.x, y: p.y }, label: p.label, actionIndex: p.actionIndex, busy: Boolean(p.busy) }
-          } : t))
-        },
-        thinking: (p) => {
-          pushActivity(id, { kind: 'tool_call', tool: p.tool, args: p.args, label: p.label, rationale: p.rationale, actionIndex: p.actionIndex })
-        },
-        frame: (p) => {
-          setTests((prev) => prev.map((t) => t.id === id ? {
-            ...t,
-            stage: { ...(t.stage || {}), image: p.image, actionIndex: p.actionIndex }
-          } : t))
-        },
-        summary_start: (p) => {
-          setTests((prev) => {
-            const next = prev.map((t) => t.id === id ? {
-              ...t,
-              status: p.passed ? 'pass' : 'fail',
-              duration: p.durationMs,
-              expectations: p.expectations || [],
-              finalUrl: p.finalUrl,
-              title: p.title,
-              summary: '',
-              summaryStreaming: true,
-              stage: t.stage ? { ...t.stage, label: p.passed ? 'done' : 'failed', finished: true } : null,
-            } : t)
-            const u = next.find((t) => t.id === id)
-            if (u) persistTask(u)
-            return next
-          })
-        },
-        summary_delta: (p) => {
-          setTests((prev) => prev.map((t) => t.id === id
-            ? { ...t, summary: (t.summary || '') + (p.delta || '') }
-            : t))
-        },
-        done: (p) => {
-          setTests((prev) => {
-            const next = prev.map((t) => t.id === id ? {
-              ...t,
-              status: p.passed ? 'pass' : 'fail',
-              duration: p.durationMs,
-              screenshots: p.screenshots || [],
-              expectations: p.expectations || [],
-              finalUrl: p.finalUrl,
-              title: p.title,
-              summary: p.summary || t.summary,
-              summaryStreaming: false,
-              stage: {
-                image: (p.screenshots && p.screenshots[p.screenshots.length - 1]) || t.stage?.image || null,
-                cursor: t.stage?.cursor || { x: 0.5, y: 0.5 },
-                label: p.passed ? 'done' : 'failed',
-                actionIndex: -1,
-                finished: true,
-              },
-            } : t)
-            const u = next.find((t) => t.id === id)
-            if (u) persistTask(u)
-            return next
-          })
-        },
-        error: (p) => {
-          setTests((prev) => {
-            const next = prev.map((t) => t.id === id ? {
-              ...t,
-              status: 'fail',
-              error: p.error,
-              summary: null,
-              stage: t.stage ? { ...t.stage, label: 'error', finished: true } : null,
-            } : t)
-            const u = next.find((t) => t.id === id)
-            if (u) persistTask(u)
-            return next
-          })
-        },
-      })
+      await startBackgroundRun('/api/run-stream', { plan, taskId: id })
+      const handlers = buildRunHandlers(id)
+      const sub = attachRunStream(id, handlers)
+      streamsRef.current.set(id, sub)
+      sub.done.then(() => finalizeRun(id))
     } catch (err) {
-      update(id, {
-        status: 'fail',
-        error: String(err.message || err),
-        stage: null,
-      })
-    } finally {
+      update(id, { status: 'fail', error: String(err.message || err), stage: null })
       setBusy(false)
     }
   }
@@ -489,119 +663,14 @@ export default function App() {
 
     pushActivity(id, { kind: 'system', text: 'Agent is observing the page and deciding each step…' })
 
-    const ac = new AbortController()
-    abortRef.current = ac
     try {
-      await streamAgent(prompt, {
-        start: (p) => {
-          update(id, { url: p.startUrl || null, stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'agent thinking…', actionIndex: -1, finished: false } })
-        },
-        observation: (p) => {
-          if (!p.url) return
-          if (p.error) {
-            pushActivity(id, { kind: 'system', text: `Step ${p.step + 1}: page load failed — ${p.error}` })
-          } else {
-            pushActivity(id, { kind: 'system', text: `Step ${p.step + 1}: observing ${p.title ? `"${p.title}" — ` : ''}${p.url}` })
-          }
-        },
-        reasoning_delta: (p) => appendReasoning(id, 'reasoning', p.delta || ''),
-        content_delta: (p) => appendReasoning(id, 'plan_json', p.delta || ''),
-        cursor: (p) => {
-          setTests((prev) => prev.map((t) => t.id === id ? {
-            ...t,
-            stage: { ...(t.stage || {}), cursor: { x: p.x, y: p.y }, label: p.label, actionIndex: p.actionIndex, busy: Boolean(p.busy) }
-          } : t))
-        },
-        thinking: (p) => {
-          finalizeReasoning(id)
-          pushActivity(id, { kind: 'tool_call', tool: p.tool, args: p.args, label: p.label, rationale: p.rationale, actionIndex: p.actionIndex })
-          setTests((prev) => prev.map((t) => t.id === id ? {
-            ...t,
-            actions: [...(t.actions || []), { tool: p.tool, args: p.args }],
-            stepDescriptions: [...(t.stepDescriptions || []), p.label],
-          } : t))
-        },
-        frame: (p) => {
-          setTests((prev) => prev.map((t) => t.id === id ? {
-            ...t,
-            stage: { ...(t.stage || {}), image: p.image, actionIndex: p.actionIndex }
-          } : t))
-        },
-        summary_start: (p) => {
-          setTests((prev) => {
-            const next = prev.map((t) => t.id === id ? {
-              ...t,
-              status: p.passed ? 'pass' : 'fail',
-              duration: p.durationMs,
-              expectations: p.expectations || [],
-              finalUrl: p.finalUrl,
-              title: p.title,
-              summary: '',
-              summaryStreaming: true,
-              stage: t.stage ? { ...t.stage, label: p.passed ? 'done' : 'failed', finished: true } : null,
-            } : t)
-            const u = next.find((t) => t.id === id)
-            if (u) persistTask(u)
-            return next
-          })
-        },
-        summary_delta: (p) => {
-          setTests((prev) => prev.map((t) => t.id === id
-            ? { ...t, summary: (t.summary || '') + (p.delta || '') }
-            : t))
-        },
-        done: (p) => {
-          setTests((prev) => {
-            const next = prev.map((t) => t.id === id ? {
-              ...t,
-              status: p.passed ? 'pass' : 'fail',
-              duration: p.durationMs,
-              screenshots: p.screenshots || [],
-              expectations: p.expectations || [],
-              finalUrl: p.finalUrl,
-              title: p.title,
-              summary: p.summary || t.summary,
-              summaryStreaming: false,
-              stage: {
-                image: (p.screenshots && p.screenshots[p.screenshots.length - 1]) || t.stage?.image || null,
-                cursor: t.stage?.cursor || { x: 0.5, y: 0.5 },
-                label: p.passed ? 'done' : 'failed',
-                actionIndex: -1,
-                finished: true,
-              },
-            } : t)
-            const u = next.find((t) => t.id === id)
-            if (u) persistTask(u)
-            return next
-          })
-        },
-        error: (p) => {
-          setTests((prev) => {
-            const next = prev.map((t) => t.id === id ? {
-              ...t,
-              status: 'fail',
-              error: p.error,
-              summary: null,
-              stage: t.stage ? { ...t.stage, label: 'error', finished: true } : null,
-            } : t)
-            const u = next.find((t) => t.id === id)
-            if (u) persistTask(u)
-            return next
-          })
-        },
-      }, undefined, ac.signal)
+      await startBackgroundRun('/api/run-agent', { goal: prompt, taskId: id })
+      const handlers = buildRunHandlers(id)
+      const sub = attachRunStream(id, handlers)
+      streamsRef.current.set(id, sub)
+      sub.done.then(() => finalizeRun(id))
     } catch (err) {
-      const msg = String(err.message || err)
-      const isAbort = err?.name === 'AbortError' || /aborted/i.test(msg)
-      if (!isAbort) {
-        update(id, {
-          status: 'fail',
-          error: msg,
-          stage: null,
-        })
-      }
-    } finally {
-      if (abortRef.current === ac) abortRef.current = null
+      update(id, { status: 'fail', error: String(err.message || err), stage: null })
       setBusy(false)
     }
   }

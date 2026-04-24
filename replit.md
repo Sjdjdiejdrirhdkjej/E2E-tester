@@ -47,6 +47,27 @@ was empty on import, so this is a fresh scaffold.
 - Falls back to the heuristic `estimateCursor` zones for non-selector actions
   (write/press/scroll) and when the probe returns nothing.
 
+## Background runs
+- `POST /api/run-stream` and `POST /api/run-agent` no longer hold the SSE
+  socket open. Both require `taskId` in the body, register the worker in an
+  in-memory `runRegistry` keyed by `taskId`, and respond immediately with
+  `{ started: true, taskId, kind }`. The worker keeps going even if the
+  client disconnects (closes the tab, switches tasks, navigates away).
+- Clients subscribe to a run via `GET /api/runs/:taskId/events` (SSE). The
+  endpoint first replays every buffered event so a late attach catches up,
+  then streams live events. Heartbeat every 10s, `event: end` when the run
+  is over (or immediately if it already finished).
+- `POST /api/runs/:taskId/abort` aborts the worker; `GET /api/runs/:taskId/status`
+  is a quick JSON probe used on app load to decide whether to re-attach.
+- Each terminal event (`done`, `error`) is also persisted into the `tasks`
+  row so the result survives a server restart. Registry entries are kept
+  ~10 minutes after completion so a returning user can still replay.
+- Frontend keeps a `streamsRef` map keyed by `taskId` so multiple runs can
+  be observed in parallel and switching between them doesn't kill any
+  subscription. On load, `loadTasks` queries `/api/runs/:id/status` for any
+  task the DB still marks `running`/`planning` and re-attaches if the
+  server confirms it's alive.
+
 ## Deploy
 - Autoscale: build `npm run build`, run `npm run start`. The Express server
   serves the built SPA from `dist/` and the `/api` routes on port 5000.
