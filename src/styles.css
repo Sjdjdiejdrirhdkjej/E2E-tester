@@ -321,11 +321,47 @@ img { max-width: 100%; }
   position: sticky; top: 0; z-index: 5;
 }
 .menu-btn { display: none; }
+
+/* Mode dropdown (E2E Tester / Browser Use) */
+.mode-dropdown-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.mode-dropdown-wrap svg {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 13px; height: 13px;
+  stroke: var(--muted);
+  pointer-events: none;
+}
+.mode-select {
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--bg-2);
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  color: var(--ink);
+  font: 13px/1 var(--sans);
+  font-weight: 600;
+  padding: 6px 28px 6px 10px;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 120ms, background 120ms;
+}
+.mode-select:hover { border-color: var(--accent); background: var(--paper); }
+.mode-select:focus { border-color: var(--accent); }
+.mode-select:disabled { opacity: 0.5; cursor: not-allowed; }
+
 .crumb {
   flex: 1;
   color: var(--muted);
   font-size: 13px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  padding-left: 4px;
 }
 .crumb b { color: var(--ink); font-weight: 600; }
 .top-actions { display: flex; gap: 8px; }

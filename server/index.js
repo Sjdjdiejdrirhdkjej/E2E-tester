@@ -1327,6 +1327,35 @@ Rules:
 - Do not reuse real credentials; use placeholders like demo@example.com.
 - Stop with finish() as soon as you have clear evidence the goal succeeded or definitively failed.`
 
+// browser-use mode: same tools, same index-based click system, but framed as a
+// general-purpose autonomous browser agent rather than a testing agent.
+// The AI completes tasks instead of asserting test outcomes.
+const BROWSER_USE_SYSTEM = `You are browser-use, an autonomous browser automation agent. Each turn you receive:
+1. The user's task or goal.
+2. A screenshot of the current page (look at it carefully — interactive elements are annotated with numbered cyan badges).
+3. A numbered list of every interactive element currently visible — this is your element index.
+4. The current URL, page title, and a snippet of the page HTML.
+
+You MUST respond by calling exactly ONE tool per turn. Do not write any prose; the tool call IS your action.
+
+Tools available:
+- navigate({ url }): go to a fully-qualified https URL (use this for the very first step if no page is loaded).
+- click({ index }): click an element by its NUMBER from the element index list. Always use the index — never guess a CSS selector. Example: click({ index: 3 }) clicks element [3].
+- type_text({ text }): type text into the field that was most recently clicked/focused. There is NO index — click the input first, then type.
+- press({ key }): press a key (e.g. "Enter" to submit a form, "Tab" to move focus, "Escape" to dismiss).
+- scroll({ direction }): "up" or "down". Use this to reveal more elements if the one you need is not visible yet.
+- wait({ milliseconds }): wait briefly for the page to settle, content to load, or animations to finish (200–3000 ms).
+- finish({ passed, reason, evidence }): call this when the task is complete or cannot be completed. Set passed=true if the task was accomplished successfully, false if it was not possible. reason is a concise human explanation; evidence is a short quoted snippet from the page that confirms the outcome.
+
+Rules:
+- Always call exactly one tool per turn — never zero, never multiple.
+- ALWAYS use click({ index: N }) — never invent or guess CSS selectors.
+- If an element you need is not visible, use scroll() to reveal more elements, then re-observe.
+- After typing text into an input, follow up with press("Enter") or click the relevant submit/search button by index.
+- Do not use real personal credentials. Use plausible placeholder data (e.g. demo@example.com, John Doe).
+- When the task is done or clearly impossible, call finish() immediately. Do not keep browsing after success.
+- Be efficient: avoid unnecessary navigations or waits. Prefer the most direct path to completing the task.`
+
 const AGENT_TOOLS = [
   { type: 'function', function: { name: 'navigate', description: 'Open a URL', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
   { type: 'function', function: { name: 'click', description: 'Click an element by its index number from the element list. Always use index, never a CSS selector.', parameters: { type: 'object', properties: { index: { type: 'integer', description: 'The element index number shown in [brackets] in the element list' } }, required: ['index'] } } },
@@ -1471,7 +1500,7 @@ async function streamAgentTurn({ messages, onReasoning, onContent, signal }) {
   return { name: null, args: null, reasoning, content }
 }
 
-async function forceFinishVerdict({ goal, observation, signal }) {
+async function forceFinishVerdict({ goal, observation, signal, systemPrompt }) {
   const obsUrl = observation?.url || '(unknown)'
   const obsTitle = observation?.title || ''
   const obsText = String(observation?.text || '').slice(0, 6000)
@@ -1480,7 +1509,7 @@ async function forceFinishVerdict({ goal, observation, signal }) {
     max_tokens: 220,
     temperature: 0,
     messages: [
-      { role: 'system', content: AGENT_SYSTEM },
+      { role: 'system', content: systemPrompt || AGENT_SYSTEM },
       {
         role: 'user',
         content:
@@ -1565,9 +1594,11 @@ app.post('/api/run-agent', async (req, res) => {
   // events. The run keeps going even if no client is attached.
   if (!FIREWORKS_API_KEY) return res.status(400).json({ error: 'FIREWORKS_API_KEY missing' })
   if (!FIRECRAWL_API_KEY) return res.status(400).json({ error: 'FIRECRAWL_API_KEY missing' })
-  const { goal, startUrl, taskId } = req.body || {}
+  const { goal, startUrl, taskId, mode } = req.body || {}
   if (!goal || typeof goal !== 'string') return res.status(400).json({ error: 'goal required' })
   if (!taskId || typeof taskId !== 'string') return res.status(400).json({ error: 'taskId required' })
+
+  const agentSystemPrompt = mode === 'browser-use' ? BROWSER_USE_SYSTEM : AGENT_SYSTEM
 
   const r = createOrResetRun(taskId, 'agent')
   res.json({ started: true, taskId, kind: 'agent' })
@@ -1602,7 +1633,7 @@ app.post('/api/run-agent', async (req, res) => {
     let aborted = ac.signal.aborted
     ac.signal.addEventListener('abort', () => { aborted = true })
     const messages = [
-      { role: 'system', content: AGENT_SYSTEM },
+      { role: 'system', content: agentSystemPrompt },
       { role: 'user', content: `Goal: ${goal}\n\n${currentUrl ? `Suggested starting URL: ${currentUrl}` : 'No starting URL provided — call navigate() first with a sensible https URL.'}` },
     ]
 
@@ -1799,7 +1830,7 @@ app.post('/api/run-agent', async (req, res) => {
     const title = lastScrape?.metadata?.title || ''
     if (!verdict && !aborted) {
       try {
-        verdict = await forceFinishVerdict({ goal, observation: lastObservation, signal: ac.signal })
+        verdict = await forceFinishVerdict({ goal, observation: lastObservation, signal: ac.signal, systemPrompt: agentSystemPrompt })
       } catch {
         verdict = heuristicFinishVerdict(goal, lastObservation)
       }

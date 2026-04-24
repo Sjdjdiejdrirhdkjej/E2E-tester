@@ -218,6 +218,7 @@ export default function App() {
   const [planMode, setPlanMode] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
   const [theme, setTheme] = useState(getInitialTheme)
+  const [appMode, setAppMode] = useState('e2e')
 
   useEffect(() => {
     // Apply theme to <html> so CSS vars cascade everywhere.
@@ -674,12 +675,15 @@ export default function App() {
     }
   }
 
-  async function planAndRun(prompt) {
+  async function planAndRun(prompt, mode) {
+    const runMode = mode || appMode
     const id = uid()
+    const modeLabel = runMode === 'browser-use' ? 'Browser Use agent starting…' : 'Agent loop starting — observing each page and deciding the next step live…'
     const draftTest = {
       id,
       name: prompt.length > 70 ? prompt.slice(0, 67) + '…' : prompt,
       prompt,
+      mode: runMode,
       actPrompt: null,
       strategistMessage: null,
       assistantSnapshot: null,
@@ -695,7 +699,7 @@ export default function App() {
       title: '',
       duration: null,
       error: null,
-      log: 'Agent loop starting — observing each page and deciding the next step live…\n',
+      log: modeLabel + '\n',
       stage: { image: null, cursor: { x: 0.5, y: 0.5 }, label: 'spinning up browser…', actionIndex: -1, finished: false },
       summary: null,
     }
@@ -704,10 +708,13 @@ export default function App() {
     setBusy(true)
     persistTask(draftTest)
 
-    pushActivity(id, { kind: 'system', text: 'Agent is observing the page and deciding each step…' })
+    const activityLabel = runMode === 'browser-use'
+      ? 'Browser Use: autonomously completing the task…'
+      : 'Agent is observing the page and deciding each step…'
+    pushActivity(id, { kind: 'system', text: activityLabel })
 
     try {
-      await startBackgroundRun('/api/run-agent', { goal: prompt, taskId: id })
+      await startBackgroundRun('/api/run-agent', { goal: prompt, taskId: id, mode: runMode })
       const handlers = buildRunHandlers(id)
       const sub = attachRunStream(id, handlers)
       streamsRef.current.set(id, sub)
@@ -806,8 +813,21 @@ export default function App() {
           <button className="icon-btn ink menu-btn" onClick={() => setNavOpen(true)} aria-label="Menu">
             <Icon name="menu" />
           </button>
+          <div className="mode-dropdown-wrap">
+            <select
+              className="mode-select"
+              value={appMode}
+              onChange={(e) => setAppMode(e.target.value)}
+              disabled={busy}
+              aria-label="Mode"
+            >
+              <option value="e2e">E2E Tester</option>
+              <option value="browser-use">Browser Use</option>
+            </select>
+            <Icon name="chevron-down" />
+          </div>
           <div className="crumb">
-            {selected ? <b>{selected.name}</b> : <>E2E Tester</>}
+            {selected ? <b>{selected.name}</b> : null}
           </div>
           <div className="top-actions">
             <button
@@ -984,7 +1004,7 @@ export default function App() {
                 value={draft}
                 onChange={setDraft}
                 onSubmit={submitDraft}
-                placeholder="Describe another test scenario…"
+                placeholder={appMode === 'browser-use' ? 'Describe another task to automate…' : 'Describe another test scenario…'}
                 disabled={busy || selected?.status === 'clarifying'}
                 planMode={planMode}
                 onPlanModeChange={setPlanMode}
@@ -994,8 +1014,8 @@ export default function App() {
         ) : (
           <div className="scroll">
             <div className="hero">
-              <h1 className="hello">Hello, <span className="accent">what shall we test today?</span></h1>
-              <p className="subhello">Just describe it, and consider it done.</p>
+              <h1 className="hello">Hello, <span className="accent">{appMode === 'browser-use' ? 'what shall we automate today?' : 'what shall we test today?'}</span></h1>
+              <p className="subhello">{appMode === 'browser-use' ? 'Describe any browser task and the agent will complete it.' : 'Just describe it, and consider it done.'}</p>
               <div className="examples">
                 {[
                   'Open duckduckgo.com, search for "Replit Agent", verify a result mentions Replit',
@@ -1018,7 +1038,9 @@ export default function App() {
                 value={draft}
                 onChange={setDraft}
                 onSubmit={submitDraft}
-                placeholder='e.g. "Open duckduckgo.com, search for replit, verify a result mentions Replit"'
+                placeholder={appMode === 'browser-use'
+                  ? 'e.g. "Go to wikipedia.org, search for Alan Turing, and find his birth year"'
+                  : 'e.g. "Open duckduckgo.com, search for replit, verify a result mentions Replit"'}
                 disabled={busy}
                 planMode={planMode}
                 onPlanModeChange={setPlanMode}
@@ -1469,9 +1491,10 @@ function Icon({ name }) {
     case 'arrow-up':   return <svg viewBox="0 0 24 24" {...common}><path d="M12 19V5M5 12l7-7 7 7"/></svg>
     case 'globe':      return <svg viewBox="0 0 24 24" {...common}><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3.5 3 14 0 18M12 3c-3 3.5-3 14 0 18"/></svg>
     case 'bolt':       return <svg viewBox="0 0 24 24" {...common}><path d="M13 3 4 14h7l-1 7 9-11h-7l1-7Z"/></svg>
-    case 'trash':      return <svg viewBox="0 0 24 24" {...common}><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
-    case 'moon':       return <svg viewBox="0 0 24 24" {...common}><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
-    case 'sun':        return <svg viewBox="0 0 24 24" {...common}><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
-    default:           return null
+    case 'trash':        return <svg viewBox="0 0 24 24" {...common}><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6"/></svg>
+    case 'moon':         return <svg viewBox="0 0 24 24" {...common}><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+    case 'sun':          return <svg viewBox="0 0 24 24" {...common}><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+    case 'chevron-down': return <svg viewBox="0 0 24 24" {...common}><path d="M6 9l6 6 6-6"/></svg>
+    default:             return null
   }
 }
