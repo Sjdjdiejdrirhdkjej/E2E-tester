@@ -1743,6 +1743,10 @@ app.post('/api/run-agent', async (req, res) => {
             ...replay,
             { type: 'wait', milliseconds: 400 },
             { type: 'executeJavascript', script: buildElementIndexAndOverlayScript() },
+            // Give the browser a frame to paint the highlight overlay before
+            // we capture, otherwise the screenshot can race the inject and
+            // come back without the cyan boxes / index badges.
+            { type: 'wait', milliseconds: 120 },
             { type: 'screenshot' },
             { type: 'executeJavascript', script: removeOverlayScript() },
           ]

@@ -1223,8 +1223,6 @@ function LiveActivity({ entries }) {
 }
 
 function LiveStage({ stage, status }) {
-  const x = stage?.cursor?.x ?? 0.5
-  const y = stage?.cursor?.y ?? 0.5
   const label = stage?.label || (status === 'planning' ? 'planning…' : 'working…')
   const frameSrc = stage?.image || null
   const busy = Boolean(stage?.busy)
@@ -1256,16 +1254,6 @@ function LiveStage({ stage, status }) {
             </div>
           </div>
         )}
-        <div
-          className={`ai-cursor ${busy ? 'busy' : ''}`}
-          style={{ left: `${x * 100}%`, top: `${y * 100}%` }}
-        >
-          <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-            <path d="M3 2 L3 18 L8 14 L11 21 L14 20 L11 13 L18 13 Z"
-              fill="#fff" stroke="#111" strokeWidth="1.4" strokeLinejoin="round" />
-          </svg>
-          <span className="ai-cursor-tag">AI</span>
-        </div>
       </div>
     </div>
   )
