@@ -423,6 +423,17 @@ export default function App() {
           stepDescriptions: [...(t.stepDescriptions || []), p.label],
         } : t))
       },
+      scratchpad: (p) => {
+        // Live mirror of the agent's durable PLAN + NOTES across long runs.
+        setTests((prev) => prev.map((t) => t.id === id ? {
+          ...t,
+          scratchpad: {
+            todos: Array.isArray(p.todos) ? p.todos : (t.scratchpad?.todos || []),
+            notes: Array.isArray(p.notes) ? p.notes : (t.scratchpad?.notes || []),
+            maxSteps: p.maxSteps ?? t.scratchpad?.maxSteps,
+          },
+        } : t))
+      },
       frame: (p) => {
         setTests((prev) => prev.map((t) => t.id === id ? {
           ...t,
@@ -936,6 +947,10 @@ export default function App() {
                 />
               )}
 
+              {(selected.scratchpad?.todos?.length > 0 || selected.scratchpad?.notes?.length > 0) && (
+                <Scratchpad scratchpad={selected.scratchpad} stepCount={selected.actions?.length || 0} />
+              )}
+
               {selected.liveActivity?.length > 0 && (
                 <LiveActivity entries={selected.liveActivity} />
               )}
@@ -1070,6 +1085,49 @@ function fmtArgs(tool, args) {
     case 'finish':    return args.passed ? 'done · passed' : 'done · failed'
     default:          return Object.entries(args).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ')
   }
+}
+
+function Scratchpad({ scratchpad, stepCount }) {
+  const todos = scratchpad?.todos || []
+  const notes = scratchpad?.notes || []
+  const maxSteps = scratchpad?.maxSteps
+  const done = todos.filter((t) => t.done).length
+  const total = todos.length
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0
+  return (
+    <div className="scratchpad">
+      <div className="scratchpad-head">
+        <div className="scratchpad-title">Plan &amp; memory</div>
+        <div className="scratchpad-meta">
+          {total > 0 && <span>{done}/{total} subtasks</span>}
+          {maxSteps != null && <span>step {stepCount} / {maxSteps}</span>}
+        </div>
+      </div>
+      {total > 0 && (
+        <div className="scratchpad-bar"><span style={{ width: pct + '%' }} /></div>
+      )}
+      {total > 0 && (
+        <ul className="todo-list">
+          {todos.map((t, i) => (
+            <li key={i} className={`todo-item ${t.done ? 'done' : ''}`}>
+              <span className="todo-check" aria-hidden="true">{t.done ? '✓' : ''}</span>
+              <span className="todo-text">{t.text}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {notes.length > 0 && (
+        <details className="notes-block">
+          <summary>{notes.length} note{notes.length === 1 ? '' : 's'}</summary>
+          <ul className="notes-list">
+            {notes.slice(-12).map((n, i) => (
+              <li key={i}>{n}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+    </div>
+  )
 }
 
 function LiveActivity({ entries }) {

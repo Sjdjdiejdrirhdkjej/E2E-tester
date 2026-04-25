@@ -1319,13 +1319,24 @@ Tools available:
 - wait({ milliseconds }): wait briefly for the page to settle (200-2000 ms).
 - finish({ passed, reason, evidence }): end the test. Set passed=true if the goal was met, false otherwise. reason is a short human explanation; evidence is a quoted snippet from the observed page text that supports the verdict.
 
+Long-horizon planning tools (use these — they are your durable memory across many steps):
+- update_todo({ items }): write or rewrite your task plan. Pass the FULL ordered list of subtasks each time, e.g. items: [{text: "open site", done: true}, {text: "search query", done: false}, ...]. Call this on step 1 to break the goal into 3–8 ordered subtasks, then call it again whenever you finish a subtask (mark it done:true) or learn something that changes the plan.
+- note({ text }): append a short durable note to your scratchpad — extracted values, observed links, evidence quotes. Notes survive across all steps and are shown back to you on every turn under "NOTES".
+
 Rules:
 - Always call exactly one tool per turn — never zero, never multiple.
 - ALWAYS use click({ index: N }) — never make up CSS selectors.
 - If an element you need is not in the list, scroll() to reveal more, then observe again.
 - After typing, follow with press("Enter") or click the submit button index.
 - Do not reuse real credentials; use placeholders like demo@example.com.
-- Stop with finish() as soon as you have clear evidence the goal succeeded or definitively failed.`
+- Stop with finish() as soon as you have clear evidence the goal succeeded or definitively failed.
+
+Autonomous strategy:
+- This run can take many steps (default budget 150). Pace yourself.
+- STEP 1 should almost always be update_todo() with a clean breakdown of the goal — this anchors the rest of the run.
+- Re-read your PLAN and NOTES (shown above each observation) before deciding the next action.
+- If you are stuck or repeating yourself, write a note explaining the obstacle and revise the TODO with a different approach.
+- Browser actions (click/type/press/scroll/navigate/wait) make real progress. update_todo and note are bookkeeping — use them when they help, not on every turn.`
 
 // browser-use mode: same tools, same index-based click system, but framed as a
 // general-purpose autonomous browser agent rather than a testing agent.
@@ -1347,6 +1358,10 @@ Tools available:
 - wait({ milliseconds }): wait briefly for the page to settle, content to load, or animations to finish (200–3000 ms).
 - finish({ passed, reason, evidence }): call this when the task is complete or cannot be completed. Set passed=true if the task was accomplished successfully, false if it was not possible. reason is a concise human explanation; evidence is a short quoted snippet from the page that confirms the outcome.
 
+Long-horizon planning tools (use these — they are your durable memory across many steps):
+- update_todo({ items }): write or rewrite your task plan. Pass the FULL ordered list of subtasks each time, e.g. items: [{text: "open site", done: true}, {text: "search query", done: false}, ...]. Call this on step 1 to break the goal into 3–8 ordered subtasks, then call it again whenever you finish a subtask (mark it done:true) or learn something that changes the plan.
+- note({ text }): append a short durable note to your scratchpad — extracted values, observed links, partial answers. Notes survive across all steps and are shown back to you on every turn under "NOTES".
+
 Rules:
 - Always call exactly one tool per turn — never zero, never multiple.
 - ALWAYS use click({ index: N }) — never invent or guess CSS selectors.
@@ -1354,7 +1369,15 @@ Rules:
 - After typing text into an input, follow up with press("Enter") or click the relevant submit/search button by index.
 - Do not use real personal credentials. Use plausible placeholder data (e.g. demo@example.com, John Doe).
 - When the task is done or clearly impossible, call finish() immediately. Do not keep browsing after success.
-- Be efficient: avoid unnecessary navigations or waits. Prefer the most direct path to completing the task.`
+- Be efficient: avoid unnecessary navigations or waits. Prefer the most direct path to completing the task.
+
+Autonomous strategy:
+- This run can take many steps (default budget 150). Pace yourself and tackle the goal in order.
+- STEP 1 should almost always be update_todo() with a clean breakdown of the goal — this anchors the rest of the run.
+- Re-read your PLAN and NOTES (shown above each observation) before deciding the next action. They are your only persistent memory.
+- Use note() the moment you extract a value, find a link, or read a piece of evidence you'll need later — older screenshots may get pruned to save context.
+- If you've taken several steps without progress, write a note explaining the obstacle and revise the TODO with a different approach.
+- Browser actions (click/type/press/scroll/navigate/wait) make real progress. update_todo and note are bookkeeping — use them when they help, not on every turn.`
 
 const AGENT_TOOLS = [
   { type: 'function', function: { name: 'navigate', description: 'Open a URL', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
@@ -1364,6 +1387,8 @@ const AGENT_TOOLS = [
   { type: 'function', function: { name: 'scroll', description: 'Scroll the page to reveal more elements', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down'] } }, required: ['direction'] } } },
   { type: 'function', function: { name: 'wait', description: 'Wait briefly for the page to settle', parameters: { type: 'object', properties: { milliseconds: { type: 'number' } }, required: ['milliseconds'] } } },
   { type: 'function', function: { name: 'finish', description: 'End the test', parameters: { type: 'object', properties: { passed: { type: 'boolean' }, reason: { type: 'string' }, evidence: { type: 'string' } }, required: ['passed', 'reason'] } } },
+  { type: 'function', function: { name: 'update_todo', description: 'Write or rewrite the persistent ordered TODO list of subtasks. Pass the FULL list each call.', parameters: { type: 'object', properties: { items: { type: 'array', description: 'Ordered subtasks. Each item: {text, done?}', items: { type: 'object', properties: { text: { type: 'string' }, done: { type: 'boolean' } }, required: ['text'] } } }, required: ['items'] } } },
+  { type: 'function', function: { name: 'note', description: 'Append one short durable note to the scratchpad (extracted value, link, evidence). Survives across all steps.', parameters: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } } },
 ]
 
 // Resolve a click-by-index tool call into a Firecrawl action.
@@ -1408,6 +1433,60 @@ function shortLabel(name, args, currentElements) {
     case 'finish':    return `finish (${args.passed ? 'pass' : 'fail'})`
     default:          return name
   }
+}
+
+// Retry helper for transient network/upstream failures. Skips retry on aborts
+// and on 4xx responses (those are deterministic logic errors).
+async function withRetry(fn, { tries = 3, baseMs = 800, signal } = {}) {
+  let lastErr
+  for (let i = 0; i < tries; i++) {
+    if (signal?.aborted) {
+      const e = new Error('aborted'); e.name = 'AbortError'; throw e
+    }
+    try { return await fn() } catch (e) {
+      lastErr = e
+      const msg = String(e?.message || e)
+      const isAbort = e?.name === 'AbortError' || /aborted/i.test(msg)
+      if (isAbort) throw e
+      if (/\b4\d\d\b/.test(msg) && !/\b408\b|\b429\b/.test(msg)) throw e
+      if (i < tries - 1) {
+        const waitMs = baseMs * Math.pow(2, i)
+        await new Promise((r) => setTimeout(r, waitMs))
+      }
+    }
+  }
+  throw lastErr
+}
+
+// Strip image_url payloads from older user messages so the multimodal context
+// doesn't blow up over a long autonomous run. Keep the most recent N images
+// (default 3); older ones are replaced with a text-only stub + their text body.
+function pruneOldImages(messages, keepLast = 3) {
+  let kept = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role !== 'user' || !Array.isArray(m.content)) continue
+    const hasImage = m.content.some((c) => c?.type === 'image_url')
+    if (!hasImage) continue
+    if (kept < keepLast) { kept++; continue }
+    const text = m.content.find((c) => c?.type === 'text')?.text || ''
+    m.content = `[earlier screenshot pruned to save context]\n${text}`
+  }
+}
+
+// Render the persistent scratchpad (TODO list + notes) into a compact text
+// block that goes at the top of each observation message — this is the
+// agent's durable memory across many steps.
+function renderScratchpad(scratchpad) {
+  const todos = Array.isArray(scratchpad?.todos) ? scratchpad.todos : []
+  const notes = Array.isArray(scratchpad?.notes) ? scratchpad.notes : []
+  const planText = todos.length
+    ? todos.map((t, i) => `${t.done ? '[x]' : '[ ]'} ${i + 1}. ${t.text}`).join('\n')
+    : '(no plan yet — call update_todo() with an ordered breakdown of the goal)'
+  const notesText = notes.length
+    ? notes.slice(-20).map((n) => `- ${n}`).join('\n')
+    : '(no notes yet)'
+  return `PLAN:\n${planText}\n\nNOTES:\n${notesText}`
 }
 
 function htmlToObservation(html) {
@@ -1594,11 +1673,14 @@ app.post('/api/run-agent', async (req, res) => {
   // events. The run keeps going even if no client is attached.
   if (!FIREWORKS_API_KEY) return res.status(400).json({ error: 'FIREWORKS_API_KEY missing' })
   if (!FIRECRAWL_API_KEY) return res.status(400).json({ error: 'FIRECRAWL_API_KEY missing' })
-  const { goal, startUrl, taskId, mode } = req.body || {}
+  const { goal, startUrl, taskId, mode, maxSteps } = req.body || {}
   if (!goal || typeof goal !== 'string') return res.status(400).json({ error: 'goal required' })
   if (!taskId || typeof taskId !== 'string') return res.status(400).json({ error: 'taskId required' })
 
   const agentSystemPrompt = mode === 'browser-use' ? BROWSER_USE_SYSTEM : AGENT_SYSTEM
+  // Long-running autonomous budget. Default 150, hard cap 500. Caller can
+  // override via { maxSteps } in the request body.
+  const stepBudget = Math.max(8, Math.min(500, Number(maxSteps) || 150))
 
   const r = createOrResetRun(taskId, 'agent')
   res.json({ started: true, taskId, kind: 'agent' })
@@ -1639,7 +1721,12 @@ app.post('/api/run-agent', async (req, res) => {
 
     let prev = { x: 0.5, y: 0.5 }
     let verdict = null
-    const MAX_STEPS = 14
+    const MAX_STEPS = stepBudget
+    // Persistent scratchpad — the agent's durable memory across many steps.
+    // Lives entirely server-side; mirrored to the client via 'scratchpad' SSE.
+    const scratchpad = { todos: [], notes: [] }
+    send('scratchpad', { todos: scratchpad.todos, notes: scratchpad.notes, maxSteps: MAX_STEPS })
+    let consecutiveBookkeepingTurns = 0   // anti-stall: too many update_todo/note in a row → nudge agent to act
     for (let step = 0; step < MAX_STEPS; step++) {
       if (aborted) break
       // 1. Observe current page (only if we have a URL).
@@ -1659,7 +1746,12 @@ app.post('/api/run-agent', async (req, res) => {
             { type: 'screenshot' },
             { type: 'executeJavascript', script: removeOverlayScript() },
           ]
-          lastScrape = await fcScrape(currentUrl, acts, ['screenshot', 'html', 'markdown'])
+          // Retry transient Firecrawl failures (timeouts, 5xx, network blips).
+          // Critical for long autonomous runs that span hundreds of HTTP calls.
+          lastScrape = await withRetry(
+            () => fcScrape(currentUrl, acts, ['screenshot', 'html', 'markdown']),
+            { tries: 3, baseMs: 800, signal: ac.signal }
+          )
           const shot = (lastScrape?.actions?.screenshots || [])[ (lastScrape?.actions?.screenshots || []).length - 1 ] || lastScrape?.screenshot
           if (shot) {
             lastShot = shot
@@ -1688,14 +1780,22 @@ app.post('/api/run-agent', async (req, res) => {
       if (aborted) break
 
       // 2. Build user observation message — multimodal when we have a screenshot.
-      // Include the numbered element index so the AI can click by number.
+      // Include the numbered element index so the AI can click by number, plus
+      // the scratchpad (PLAN + NOTES) at the top so the agent always sees its
+      // own durable memory.
       const elementIndexText = formatElementsForAI(observation.elements || currentElements)
+      const memoryHeader = renderScratchpad(scratchpad)
+      const stepHeader = `Step ${step + 1} of ${MAX_STEPS} (${MAX_STEPS - step - 1} remaining).`
+      // Light-touch nudge every 30 steps to encourage replanning on long runs.
+      const reflectionNudge = (step > 0 && step % 30 === 0)
+        ? '\n\nSelf-check: you are a long way into the run. Re-read your PLAN above and update_todo() if priorities have shifted, otherwise continue with the next concrete browser action.'
+        : ''
       const obsText = observation.error
-        ? `Step ${step + 1}. Page load failed: ${observation.error}\nDecide the next single tool call.`
-        : `Step ${step + 1}.\nCurrent URL: ${observation.url}\nPage title: ${observation.title}\n\n` +
+        ? `${stepHeader}\n\n${memoryHeader}\n\nPage load failed: ${observation.error}\nDecide the next single tool call.${reflectionNudge}`
+        : `${stepHeader}\n\n${memoryHeader}\n\nCurrent URL: ${observation.url}\nPage title: ${observation.title}\n\n` +
           `Interactive elements on this page (use these index numbers to click):\n${elementIndexText}\n\n` +
           `Visible page HTML (truncated — for context only, use element index numbers above to click):\n${observation.text}\n\n` +
-          `Call exactly one tool. To click something, use click({ index: N }) with the number from the list above.`
+          `Call exactly one tool. To click something, use click({ index: N }) with the number from the list above.${reflectionNudge}`
       const userContent = screenshotDataUrl
         ? [
             { type: 'image_url', image_url: { url: screenshotDataUrl } },
@@ -1704,16 +1804,23 @@ app.post('/api/run-agent', async (req, res) => {
         : obsText
       messages.push({ role: 'user', content: userContent })
 
-      // 3. Stream agent turn.
+      // Prune older screenshots from message history to keep multimodal context
+      // small over a long run. Always keeps the latest 3 visual frames.
+      pruneOldImages(messages, 3)
+
+      // 3. Stream agent turn (with retry on transient upstream failures).
       send('cursor', { actionIndex: step, x: prev.x, y: prev.y, label: 'agent thinking…', busy: true })
       let turn
       try {
-        turn = await streamAgentTurn({
-          messages,
-          signal: ac.signal,
-          onReasoning: (d) => send('reasoning_delta', { step, delta: d }),
-          onContent:   (d) => send('content_delta',   { step, delta: d }),
-        })
+        turn = await withRetry(
+          () => streamAgentTurn({
+            messages,
+            signal: ac.signal,
+            onReasoning: (d) => send('reasoning_delta', { step, delta: d }),
+            onContent:   (d) => send('content_delta',   { step, delta: d }),
+          }),
+          { tries: 3, baseMs: 1000, signal: ac.signal }
+        )
       } catch (err) {
         if (aborted) break
         const msg = `Agent step ${step + 1} failed: ${err.message || err}`
@@ -1727,12 +1834,15 @@ app.post('/api/run-agent', async (req, res) => {
         send('reasoning_delta', { step, delta: '\n[no tool call returned — re-prompting]\n' })
         messages.push({ role: 'user', content: 'You must call exactly one tool. Do not write prose. Pick the single best next tool call now.' })
         try {
-          turn = await streamAgentTurn({
-            messages,
-            signal: ac.signal,
-            onReasoning: (d) => send('reasoning_delta', { step, delta: d }),
-            onContent:   (d) => send('content_delta',   { step, delta: d }),
-          })
+          turn = await withRetry(
+            () => streamAgentTurn({
+              messages,
+              signal: ac.signal,
+              onReasoning: (d) => send('reasoning_delta', { step, delta: d }),
+              onContent:   (d) => send('content_delta',   { step, delta: d }),
+            }),
+            { tries: 2, baseMs: 800, signal: ac.signal }
+          )
         } catch (err) {
           if (aborted) break
           const msg = `Agent step ${step + 1} retry failed: ${err.message || err}`
@@ -1807,6 +1917,39 @@ app.post('/api/run-agent', async (req, res) => {
         messages.push({ role: 'tool', tool_call_id: `c${step}`, content: 'OK' })
         break
       }
+      // Bookkeeping tools — update the durable scratchpad. They don't drive
+      // the browser, so the URL/replay state is unchanged.
+      if (turn.name === 'update_todo') {
+        const items = Array.isArray(turn.args?.items) ? turn.args.items : []
+        scratchpad.todos = items
+          .filter((it) => it && typeof it.text === 'string' && it.text.trim())
+          .slice(0, 30)
+          .map((it) => ({ text: String(it.text).slice(0, 240).trim(), done: Boolean(it.done) }))
+        send('scratchpad', { todos: scratchpad.todos, notes: scratchpad.notes })
+        consecutiveBookkeepingTurns++
+        const ack = `todo updated (${scratchpad.todos.length} items, ${scratchpad.todos.filter((t) => t.done).length} done)`
+        messages.push({ role: 'tool', tool_call_id: `c${step}`, content: ack })
+        if (consecutiveBookkeepingTurns >= 3) {
+          messages.push({ role: 'user', content: 'You have used several consecutive bookkeeping turns. Now take a concrete browser action (navigate/click/type/scroll/wait) to make real progress.' })
+        }
+        continue
+      }
+      if (turn.name === 'note') {
+        const txt = String(turn.args?.text || '').slice(0, 600).trim()
+        if (txt) {
+          scratchpad.notes.push(txt)
+          if (scratchpad.notes.length > 60) scratchpad.notes = scratchpad.notes.slice(-60)
+        }
+        send('scratchpad', { todos: scratchpad.todos, notes: scratchpad.notes })
+        consecutiveBookkeepingTurns++
+        messages.push({ role: 'tool', tool_call_id: `c${step}`, content: txt ? `note saved (${scratchpad.notes.length} total)` : 'empty note ignored' })
+        if (consecutiveBookkeepingTurns >= 3) {
+          messages.push({ role: 'user', content: 'You have used several consecutive bookkeeping turns. Now take a concrete browser action (navigate/click/type/scroll/wait) to make real progress.' })
+        }
+        continue
+      }
+      // Any non-bookkeeping tool resets the anti-stall counter.
+      consecutiveBookkeepingTurns = 0
       if (turn.name === 'navigate') {
         const newUrl = String(turn.args?.url || '').trim()
         if (newUrl) { currentUrl = newUrl; replay = []; currentElements = [] }
