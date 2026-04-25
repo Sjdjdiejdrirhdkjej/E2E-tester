@@ -1009,8 +1009,6 @@ export default function App() {
               <div className="aside-h">Stack</div>
               <div className="kv">
                 <div className="k">Plan mode</div><div className="v">GLM 5.1 · create_plan only</div>
-                <div className="k">Act planner</div><div className="v">Kimi K2 · Fireworks</div>
-                <div className="k">Browser</div><div className="v">Firecrawl /scrape</div>
               </div>
             </aside>
 
@@ -1507,8 +1505,6 @@ function PromptBox({ value, onChange, onSubmit, placeholder, disabled, planMode,
       />
       <div className="prompt-row">
         <div className="chip-row">
-          <span className="chip"><Icon name="globe" /> Firecrawl</span>
-          <span className="chip"><Icon name="bolt" /> Act planner</span>
           {onPlanModeChange && (
             <label className="chip plan-toggle" title="GLM 5.1 (max reasoning): only tool is create_plan to brief the act agent; otherwise asks in text">
               <input
