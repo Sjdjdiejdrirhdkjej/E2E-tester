@@ -210,15 +210,39 @@ function getInitialTheme() {
   return getStoredTheme() || getSystemTheme()
 }
 
+const VALID_MODES = new Set(['e2e', 'browser-use'])
+
+function normalizeMode(m) {
+  return VALID_MODES.has(m) ? m : 'e2e'
+}
+
+function parseRoute(pathname) {
+  const m = String(pathname || '').match(/^\/(e2e|browser-use)(?:\/([^/?#]+))?\/?$/)
+  if (!m) return { mode: null, taskId: null }
+  return { mode: m[1], taskId: m[2] ? decodeURIComponent(m[2]) : null }
+}
+
+function buildPath(mode, taskId) {
+  const m = normalizeMode(mode)
+  return taskId ? `/${m}/${encodeURIComponent(taskId)}` : `/${m}`
+}
+
+function getInitialRoute() {
+  if (typeof window === 'undefined') return { mode: 'e2e', taskId: null }
+  const r = parseRoute(window.location.pathname)
+  return { mode: r.mode || 'e2e', taskId: r.taskId }
+}
+
 export default function App() {
+  const initialRoute = getInitialRoute()
   const [tests, setTests] = useState([])
-  const [selectedId, setSelectedId] = useState(null)
+  const [selectedId, setSelectedId] = useState(initialRoute.taskId)
   const [busy, setBusy] = useState(false)
   const [draft, setDraft] = useState('')
   const [planMode, setPlanMode] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
   const [theme, setTheme] = useState(getInitialTheme)
-  const [appMode, setAppMode] = useState('e2e')
+  const [appMode, setAppMode] = useState(initialRoute.mode)
 
   useEffect(() => {
     // Apply theme to <html> so CSS vars cascade everywhere.
@@ -338,6 +362,40 @@ export default function App() {
   }
 
   useEffect(() => { loadTasks() }, [])
+
+  // ---- URL routing: /<mode>/<taskId> ----
+  // Keep the address bar in sync with (appMode, selectedId, selected.mode).
+  // If the selected task has a `mode` that differs from appMode, adopt it so
+  // the URL prefix matches reality (e.g. selecting a saved browser-use task
+  // from the sidebar navigates to /browser-use/<id>).
+  useEffect(() => {
+    if (selected && selected.mode && selected.mode !== appMode) {
+      setAppMode(normalizeMode(selected.mode))
+    }
+  }, [selected?.id, selected?.mode])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const modeForUrl = selected?.mode ? normalizeMode(selected.mode) : appMode
+    const desired = buildPath(modeForUrl, selectedId || null)
+    const cur = window.location.pathname
+    if (cur !== desired) {
+      window.history.pushState({}, '', desired + window.location.search + window.location.hash)
+    }
+  }, [selectedId, selected?.mode, appMode])
+
+  // Browser back/forward → re-sync state from the URL.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const onPop = () => {
+      const r = parseRoute(window.location.pathname)
+      const mode = normalizeMode(r.mode || 'e2e')
+      setAppMode(mode)
+      setSelectedId(r.taskId || null)
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
 
   useEffect(() => {
     if (streamRef.current) streamRef.current.scrollTop = streamRef.current.scrollHeight
@@ -828,7 +886,13 @@ export default function App() {
             <select
               className="mode-select"
               value={appMode}
-              onChange={(e) => setAppMode(e.target.value)}
+              onChange={(e) => {
+                const next = normalizeMode(e.target.value)
+                setAppMode(next)
+                // Deselect any open task when switching modes — a task is
+                // mode-specific and the URL prefix must match its mode.
+                setSelectedId(null)
+              }}
               disabled={busy}
               aria-label="Mode"
             >
